@@ -17,7 +17,7 @@ It focuses on secure key derivation, authenticated encryption, and memory-safety
 The project demonstrates defensive systems engineering practices including streaming cryptographic hashing, memory-hardened key derivation, and secure handling of sensitive data in RAM.
 
 Architecture Overview
-```mermaid
+```
 graph TD
     A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
     B[Pulsar Dataset Hash] -->|BLAKE3| D
