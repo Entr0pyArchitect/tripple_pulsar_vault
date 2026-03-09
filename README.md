@@ -18,7 +18,6 @@ The project demonstrates defensive systems engineering practices including strea
 
 Architecture Overview
 
-```mermaid
 graph TD
     A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
     B[Pulsar Dataset Hash] -->|BLAKE3| D
