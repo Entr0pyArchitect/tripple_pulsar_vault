@@ -25,6 +25,7 @@ graph TD
     D --> E{AEAD Engine}
     E -->|AES-256-GCM| F[TPF2 Vault File]
     G[Vault Header] -.->|Associated Data| E
+```
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
 The dataset is stream-hashed using BLAKE3, and the resulting digest is concatenated with the user passphrase before being processed by Argon2id.
