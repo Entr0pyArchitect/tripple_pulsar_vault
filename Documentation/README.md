@@ -1,15 +1,16 @@
 # 🌌 TripplePulsar Vault (TPV)
 
-```text
-  ██████╗██████╗ ██╗██████╗ ██████╗ ██╗      ███████╗
-  ╚══██╔══╝██╔══██╗██║██╔══██╗██╔══██╗██║      ██╔════╝
-    ██║   ██████╔╝██║██████╔╝██████╔╝██║      █████╗
-    ██║   ██╔══██╗██║██╔═══╝ ██╔═══╝ ██║      ██╔══╝
-    ██║   ██║  ██║██║██║      ██║      ███████╗███████╗
-    ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝      ╚═╝      ╚══════╝╚══════╝
-
-      T R I P P L E  P U L S A R  V A U L T
-      "Tripple checking that security since 2026"
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ████████╗██████╗ ██╗██████╗ ██████╗ ██╗      ███████╗                   │
+│  ╚══██╔══╝██╔══██╗██║██╔══██╗██╔══██╗██║      ██╔════╝                   │
+│     ██║   ██████╔╝██║██████╔╝██████╔╝██║      █████╗                     │
+│     ██║   ██╔══██╗██║██╔═══╝ ██╔═══╝ ██║      ██╔══╝                     │
+│     ██║   ██║  ██║██║██║      ██║      ███████╗███████╗                  │
+│     ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝      ╚═╝      ╚══════╝╚══════╝                  │
+│                                                                          │
+│           T R I P P L E   P U L S A R   V A U L T                        │
+│          "Tripple checking that security since 2026"                     │
+└──────────────────────────────────────────────────────────────────────────┘
 
 TripplePulsar Vault (TPV) is a high-assurance cryptographic file sequestration environment written in Rust.
 It focuses on secure key derivation, authenticated encryption, and memory-safety practices designed to resist offline vault cracking and common memory-exposure risks.
