@@ -81,3 +81,14 @@ Most applications passively allow the OS to page memory to the hard drive, leavi
 
 ## Conclusion
 TripplePulsar Vault represents the pinnacle of personal data protection. By combining astronomical entropy, strict AEAD integrity checks, and kernel-level memory protection, it creates a "Sequestration Zone" where secrets can be stored with the highest degree of confidence.
+
+
+
+
+## 🔮 Future Roadmap (Version 2.0)
+While V1.0 establishes a pristine, mathematically sound sequestration zone, future iterations will expand the defense-in-depth architecture to neutralize emerging threats:
+
+* **TPM 2.0 Hardware Binding:** Integration with the Windows TBS (TPM Base Services) API to physically bind the cryptographic vault to the host machine's motherboard. This will render exfiltrated vaults entirely useless, even if the adversary possesses the master passphrase and the exact astronomical dataset.
+* **Polymorphic Cipher Engine:** Implementing dynamic trait dispatch to allow runtime selection between `AES-256-GCM` and `XChaCha20-Poly1305`, preventing single-algorithm points of failure.
+* **Automated Fuzz Testing Pipeline:** Aggressive, continuous memory-fuzzing of the `TPF2` binary parsing engine to mathematically guarantee absolute resilience against maliciously crafted or corrupted vault headers.
+* **Post-Quantum Cryptography (PQC) Readiness:** Mapping out integration for CNSA 2.0 compliant algorithms (such as ML-KEM) to defend against future quantum-enabled decryption threats ("Harvest Now, Decrypt Later").
