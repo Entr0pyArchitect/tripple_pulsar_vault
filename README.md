@@ -47,43 +47,6 @@ Option 3 (Inspect Vault Header): Probes the 62-byte TPF2 header to verify KDF me
 Option 0 (Self-Destruct): Emergency interrupt. Instantly scrubs the Windows clipboard, unlocks all pinned RAM, zeroizes in-scope memory, and terminates the process.
 
 
-***
-
-### 2. `TripplePulsarVault White Paper.md`
-
-```markdown
-# TripplePulsar: A High-Assurance Entropy Model for Data Sequestration
-
-## Abstract
-Modern data security often fails not at the encryption algorithm level, but at the implementation level—specifically memory forensics and entropy exhaustion. TripplePulsar addresses these vulnerabilities by introducing a "Triple Pillar" approach: Memory-Hardened Key Derivation Functions (KDFs), Astronomical Entropy Diversification, and Hardware-Level OS Integration. It is a software-defined security boundary engineered for high-threat environments.
-
-## 1. Astronomical Entropy Diversification
-Traditional encryption relies on a single secret (the passphrase). If the passphrase is weak or the memory is dumped, the data is lost. TripplePulsar addresses the "Entropy Exhaustion" problem by injecting deterministic "Natural Entropy" from massive external Pulsar datasets to fortify the root key. 
-
-
-
-By streaming gigabytes of astrophysical data through a BLAKE3 hashing engine and combining it with OS-generated randomness and the user's passphrase, the system expands the Initial Keying Material (IKM). This renders pre-computation, dictionary, or rainbow-table attacks mathematically unfeasible.
-
-## 2. Cryptographic Integrity and the TPF2 Format
-TripplePulsar employs an Authenticated Encryption with Associated Data (AEAD) construction. 
-
-
-
-The proprietary `TPF2` binary format rigorously defines a 62-byte header containing the salt, nonces, and KDF parameters. This entire header is bound to the AES-256-GCM cipher as Associated Authenticated Data. The system mathematically verifies the integrity of the data before the decryption engine ever attempts to process the plaintext, neutralizing bit-flipping and tampering attacks.
-
-## 3. Memory Hardening & Anti-Forensics
-Most applications passively allow the OS to page memory to the hard drive, leaving master keys recoverable long after the machine powers down (the "Swap-File Leak"). TripplePulsar mitigates this via deep Windows API integration:
-
-* **RAM Pinning:** Pins sensitive key material to physical RAM using the Windows `VirtualLock` API, preventing keys from bleeding into the hard drive's swap-file (`pagefile.sys`). 
-
-* **DoD-Level Wiping:** Standard file deletion removes only the file pointer, leaving the plaintext data on the disk sectors. TripplePulsar's standalone shredder physically overwrites the data blocks (random overwrite followed by a zero-fill) prior to OS-level unlinking.
-
-
-## Conclusion
-TripplePulsar Vault represents the pinnacle of personal data protection. By combining astronomical entropy, strict AEAD integrity checks, and kernel-level memory protection, it creates a "Sequestration Zone" where secrets can be stored with the highest degree of confidence.
-
-
-
 
 ## 🔮 Future Roadmap (Version 2.0)
 While V1.0 establishes a pristine, mathematically sound sequestration zone, future iterations will expand the defense-in-depth architecture to neutralize emerging threats:
