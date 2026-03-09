@@ -17,7 +17,7 @@ It focuses on secure key derivation, authenticated encryption, and memory-safety
 The project demonstrates defensive systems engineering practices including streaming cryptographic hashing, memory-hardened key derivation, and secure handling of sensitive data in RAM.
 
 Architecture Overview
-
+```mermaid
 graph TD
     A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
     B[Pulsar Dataset Hash] -->|BLAKE3| D
@@ -25,7 +25,6 @@ graph TD
     D --> E{AEAD Engine}
     E -->|AES-256-GCM| F[TPF2 Vault File]
     G[Vault Header] -.->|Associated Data| E
-
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
 The dataset is stream-hashed using BLAKE3, and the resulting digest is concatenated with the user passphrase before being processed by Argon2id.
