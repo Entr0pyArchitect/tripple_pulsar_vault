@@ -18,13 +18,19 @@ The project demonstrates defensive systems engineering practices including strea
 
 Architecture Overview
 
-graph TD
-    A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
-    B[Pulsar Dataset Hash] -->|BLAKE3| D
-    C[Windows OS Salt] --> D
-    D --> E{AEAD Engine}
-    E -->|AES-256-GCM| F[TPF2 Vault File]
-    G[Vault Header] -.->|Associated Data| E
+flowchart TD
+    A["User Passphrase"]
+    B["Pulsar Dataset Hash"]
+    C["Windows OS Salt"]
+
+    A -->|Argon2id| D["Master Key Derivation"]
+    B -->|BLAKE3| D
+    C --> D
+
+    D --> E["AEAD Engine"]
+    E -->|AES-256-GCM| F["TPF2 Vault File"]
+
+    G["Vault Header"] -. Associated Data .-> E
 
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
