@@ -8,6 +8,7 @@ use secrecy::{Secret, ExposeSecret};
 use thiserror::Error;
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
 use crate::format::Tpf2Header;
+use zeroize::Zeroize; // Hardens the Intermediate Key Material (IKM)
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -37,8 +38,8 @@ pub fn hash_pulsar_dataset(file_path: &str) -> Result<blake3::Hash, CryptoError>
     Ok(hasher.finalize())
 }
 
-/// Derives the ultimate master key using the user's passphrase, the OS salt, 
-/// and optionally the massive BLAKE3 dataset hash.
+/// Derives a 256-bit master key from the passphrase and optional dataset hash using Argon2id.
+/// The IKM is zeroized immediately after the derivation to prevent memory forensics.
 pub fn derive_master_key(
     passphrase: &Secret<String>,
     dataset_hash: Option<blake3::Hash>,
@@ -51,17 +52,22 @@ pub fn derive_master_key(
         .map_err(|_| CryptoError::KdfError)?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+    // Combine passphrase and dataset hash into the Intermediate Key Material (IKM)
     let mut ikm = Vec::new();
     ikm.extend_from_slice(passphrase.expose_secret().as_bytes());
-    
     if let Some(hash) = dataset_hash {
         ikm.extend_from_slice(hash.as_bytes());
     }
 
     let mut master_key = vec![0u8; 32];
     
-    argon2.hash_password_into(ikm.as_slice(), os_salt, &mut master_key)
-        .map_err(|_| CryptoError::KdfError)?;
+    // Deriving the key using the memory-hard Argon2id algorithm
+    let res = argon2.hash_password_into(ikm.as_slice(), os_salt, &mut master_key);
+    
+    // SECURE TEARDOWN: Manually scrub the IKM from RAM now that derivation is complete
+    ikm.zeroize();
+    
+    res.map_err(|_| CryptoError::KdfError)?;
 
     Ok(Secret::new(master_key))
 }

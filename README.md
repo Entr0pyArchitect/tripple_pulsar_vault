@@ -20,17 +20,13 @@ Architecture Overview
 
 Encryption Pipeline
 
-User Passphrase
-      +
-Optional Dataset Hash (BLAKE3)
-      ↓
-Argon2id Memory-Hardened KDF
-      ↓
-Derived Encryption Key
-      ↓
-AES-256-GCM Authenticated Encryption
-      ↓
-TPF2 Vault File
+graph TD
+    A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
+    B[Pulsar Dataset Hash] -->|BLAKE3| D
+    C[Windows OS Salt] --> D
+    D --> E{AEAD Engine}
+    E -->|AES-256-GCM| F[TPF2 Vault File]
+    G[Vault Header] -.->|Associated Data| E
 
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
@@ -158,23 +154,26 @@ Assumptions:
 
       Required datasets remain available
 
-Future Roadmap:
 
-      TPM Hardware Binding
+      
+      
+      
+      
+      
+      ## 🔮 Future Roadmap (Version 2.0)
 
-      Optional TPM 2.0 integration to bind vaults to specific hardware.
+TripplePulsar V1.0 establishes a pristine, mathematically sound sequestration zone. The next development cycle will focus on moving from a robust defensive tool to a research-grade cryptographic implementation.
 
-      Multiple Cipher Support
+### 🧬 Cryptographic Evolution
+* **Multi-Domain Key Derivation (HKDF):** Transitioning from simple IKM concatenation to a formal **Extract-and-Expand** KDF tree. This provides cryptographic compartmentalization, ensuring that Domain A (Encryption) and Domain B (Integrity) are mathematically independent.
+* **Post-Quantum Readiness (CNSA 2.0):** Integration of post-quantum KEMs (ML-KEM/Kyber) to neutralize the threat of "Harvest Now, Decrypt Later" quantum attacks.
 
-      Support for additional AEAD algorithms such as XChaCha20-Poly1305.
+### 🛡️ Hardened System Integration
+* **TPM 2.0 Hardware Sealing:** Utilizing the Windows TBS (TPM Base Services) API to seal vault keys directly to the physical motherboard's PCR (Platform Configuration Registers).
+* **Polymorphic Cipher Engine:** Implementing algorithm agility to allow runtime selection between `AES-256-GCM` and `XChaCha20-Poly1305`, preventing single-point-of-failure in the cipher suite.
 
-      Fuzz Testing Pipeline
-
-      Continuous fuzzing of vault header parsing.
-
-      Post-Quantum Readiness
-
-      Exploration of integration with CNSA 2.0-aligned cryptographic primitives.
+### 🧪 Adversarial Robustness
+* **Automated Fuzzing Harness:** Expanding the `fuzz/` directory into a continuous integration pipeline, subjecting the `TPF2` parser to millions of mutated inputs to guarantee 100% resilience against malformed header exploits.
 
       
       
