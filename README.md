@@ -18,7 +18,6 @@ The project demonstrates defensive systems engineering practices including strea
 
 Architecture Overview
 
-```mermaid
 graph TD
     A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
     B[Pulsar Dataset Hash] -->|BLAKE3| D
@@ -26,7 +25,6 @@ graph TD
     D --> E{AEAD Engine}
     E -->|AES-256-GCM| F[TPF2 Vault File]
     G[Vault Header] -.->|Associated Data| E
-```
 
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
