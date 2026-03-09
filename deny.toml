@@ -1,0 +1,32 @@
+# deny.toml - Supply Chain Security Config
+
+[advisories]
+# Instantly fail the build if a crate has a known CVE
+vulnerability = "deny"
+# Warn us if a crate has been abandoned by its author
+unmaintained = "warn"
+# Warn us if a specific version was yanked from crates.io
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Reject any code that doesn't have a recognized open-source license
+unlicensed = "deny"
+# Only allow heavily vetted, permissive licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib"
+]
+# Deny strict copyleft licenses (like GPL) to keep your project proprietary if needed
+copyleft = "deny"
+allow-osi-fsf-free = "both"
+
+[bans]
+# Warn if our dependencies pull in two different versions of the same crate
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"

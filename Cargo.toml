@@ -1,0 +1,27 @@
+[package]
+name = "tripple_pulsar_vault"
+version = "0.1.0"
+edition = "2024"
+authors = ["Triple Pulsar Creator"]
+
+[dependencies]
+# 🛡️ Core Cryptography & Entropy
+aes-gcm = "0.10"
+argon2 = "0.5"
+blake3 = "1.5"
+rand = "0.8" # Required for the DoD-level file shredder
+
+# 🧽 Memory Safety
+secrecy = "0.8"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# 🪟 Windows OS Integration (Win10/Win11 specific)
+windows = { version = "0.58", features = [
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+    "Win32_Foundation"
+] }
+
+# 🛠️ Utilities & CLI
+thiserror = "1.0"
+rpassword = "7.3"
