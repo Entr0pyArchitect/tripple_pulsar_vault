@@ -20,13 +20,14 @@ Architecture Overview
 
 Encryption Pipeline
 
+<pre><code>```mermaid
 graph TD
-    A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
-    B[Pulsar Dataset Hash] -->|BLAKE3| D
-    C[Windows OS Salt] --> D
-    D --> E{AEAD Engine}
-    E -->|AES-256-GCM| F[TPF2 Vault File]
-    G[Vault Header] -.->|Associated Data| E
+A[User Passphrase] -->|Argon2id| D[Master Key Derivation]
+B[Pulsar Dataset Hash] -->|BLAKE3| D
+C[Windows OS Salt] --> D
+D --> E{AEAD Engine}
+E -->|AES-256-GCM| F[TPF2 Vault File]
+G[Vault Header] -.->|Associated Data| E
 
 TPV optionally allows the user to incorporate a large external dataset into the key-derivation pipeline.
 
