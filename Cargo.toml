@@ -1,27 +1,50 @@
 [package]
 name = "tripple_pulsar_vault"
-version = "0.1.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["Triple Pulsar Creator"]
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["legacy-tpf2", "tpf3"]
+legacy-tpf2 = []
+tpf3 = ["cipher-xchacha20poly1305", "pq-mlkem768", "tpm-windows"]
+
+cipher-xchacha20poly1305 = ["dep:chacha20poly1305"]
+pq-mlkem768 = ["dep:ml-kem"]
+tpm-windows = []
 
 [dependencies]
-# 🛡️ Core Cryptography & Entropy
+# Core cryptography
 aes-gcm = "0.10"
 argon2 = "0.5"
 blake3 = "1.5"
-rand = "0.8" # Required for the DoD-level file shredder
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
 
-# 🧽 Memory Safety
+# Additional cipher / PQ support
+chacha20poly1305 = { version = "0.10", optional = true }
+ml-kem = { version = "0.2", optional = true }
+
+# Memory safety
 secrecy = "0.8"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
-# 🪟 Windows OS Integration (Win10/Win11 specific)
-windows = { version = "0.58", features = [
-    "Win32_System_Memory",
-    "Win32_System_DataExchange",
-    "Win32_Foundation"
-] }
-
-# 🛠️ Utilities & CLI
+# Utilities / CLI
 thiserror = "1.0"
 rpassword = "7.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+    "Win32_Security_Cryptography"
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

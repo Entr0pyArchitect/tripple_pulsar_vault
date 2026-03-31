@@ -2,40 +2,520 @@
 
 mod crypto;
 mod format;
-mod win32;
 mod shred;
+mod win32;
 
-use secrecy::Secret;
-use std::io::{self, Write};
-use std::fs;
 use rand::{thread_rng, RngCore};
+use secrecy::Secret;
+use std::fs;
+use std::io::{self, Write};
+
+use crate::format::{
+    parse_vault_header, CipherSuite, KeyWrapMode, ParsedVaultHeader, Tpf2Header, Tpf3Header,
+};
+use crate::win32::TpmKeyScope;
+
+const DEFAULT_KDF_M_COST: u32 = 262_144; // 256 MiB
+const DEFAULT_KDF_T_COST: u16 = 3;
+const DEFAULT_KDF_P_COST: u8 = 1;
 
 fn print_banner() {
     let banner = r#"
   ██████╗██████╗ ██╗██████╗ ██████╗ ██╗      ███████╗
   ╚══██╔══╝██╔══██╗██║██╔══██╗██╔══██╗██║      ██╔════╝
-    ██║   ██████╔╝██║██████╔╝██████╔╝██║      █████╗  
-    ██║   ██╔══██╗██║██╔═══╝ ██╔═══╝ ██║      ██╔══╝  
+    ██║   ██████╔╝██║██████╔╝██████╔╝██║      █████╗
+    ██║   ██╔══██╗██║██╔═══╝ ██╔═══╝ ██║      ██╔══╝
     ██║   ██║  ██║██║██║      ██║      ███████╗███████╗
     ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝      ╚═╝      ╚══════╝╚══════╝
-      P  U  L  S  A  R      V  A  U  L  T
-      "Tripple checking that security since 2026"
+      P U L S A R   V A U L T   3.0
 "#;
-    println!("{}", banner);
+    println!("{banner}");
+    println!("Windows-oriented cryptographic file vault with TPF2 compatibility and TPF3 support.\n");
 }
 
 fn prompt_input(prompt: &str) -> String {
-    print!("{}", prompt);
+    print!("{prompt}");
     io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     input.trim().to_string()
 }
 
+fn prompt_yes_no(prompt: &str) -> bool {
+    matches!(prompt_input(prompt).to_lowercase().as_str(), "y" | "yes")
+}
+
 fn prompt_passphrase() -> Secret<String> {
-    let password = rpassword::prompt_password("Enter Vault Passphrase: ")
-        .expect("Failed to read passphrase");
+    let password =
+        rpassword::prompt_password("Enter vault passphrase: ").expect("Failed to read passphrase");
     Secret::new(password.trim().to_string())
+}
+
+fn load_optional_dataset_hash(encrypting: bool) -> Result<Option<blake3::Hash>, ()> {
+    let prompt = if encrypting {
+        "  -> Use an auxiliary dataset in key derivation? (y/n): "
+    } else {
+        "  -> Was an auxiliary dataset used when this vault was created? (y/n): "
+    };
+
+    if !prompt_yes_no(prompt) {
+        return Ok(None);
+    }
+
+    let path_prompt = if encrypting {
+        "  -> Enter path to dataset (for example, HTRU_2.csv): "
+    } else {
+        "  -> Enter path to the exact same dataset used during encryption: "
+    };
+
+    let dataset_path = prompt_input(path_prompt);
+    println!("[*] Hashing dataset with BLAKE3...");
+
+    match crypto::hash_pulsar_dataset(&dataset_path) {
+        Ok(hash) => {
+            println!("[+] Dataset hash completed.");
+            Ok(Some(hash))
+        }
+        Err(e) => {
+            eprintln!("[!] Failed to process dataset: {e}");
+            Err(())
+        }
+    }
+}
+
+fn select_cipher_suite() -> Option<CipherSuite> {
+    println!("\nSelect cipher suite:");
+    println!("1. AES-256-GCM");
+    println!("2. XChaCha20-Poly1305");
+
+    match prompt_input("Choice: ").as_str() {
+        "1" => Some(CipherSuite::Aes256Gcm),
+        "2" => Some(CipherSuite::XChaCha20Poly1305),
+        _ => {
+            eprintln!("[!] Invalid cipher suite selection.");
+            None
+        }
+    }
+}
+
+fn select_tpm_scope() -> Option<TpmKeyScope> {
+    println!("\nSelect TPM key scope:");
+    println!("1. Current user");
+    println!("2. Local machine");
+
+    match prompt_input("Choice: ").as_str() {
+        "1" => Some(TpmKeyScope::CurrentUser),
+        "2" => Some(TpmKeyScope::LocalMachine),
+        _ => {
+            eprintln!("[!] Invalid TPM scope selection.");
+            None
+        }
+    }
+}
+
+fn inspect_tpf2_header(header: &Tpf2Header) {
+    println!("\n[+] Parsed TPF2 header:");
+    println!("    Version: {}", header.version);
+    println!("    Algorithm: {}", header.algorithm_name());
+    println!("    KDF: {}", header.kdf_name());
+    println!("    Argon2id Memory Cost: {} KiB", header.kdf_m);
+    println!("    Argon2id Time Cost: {} iterations", header.kdf_t);
+    println!("    Argon2id Parallelism: {} lane(s)", header.kdf_p);
+    println!(
+        "    Key Schedule: {}",
+        if header.uses_v2_key_schedule() {
+            "TPV 2.0 (Argon2id root key + HKDF expansion)"
+        } else {
+            "Legacy TPV 1.x (direct Argon2id output)"
+        }
+    );
+    println!(
+        "    TPM Flag: {}",
+        if header.tpm_flag == 1 { "YES" } else { "NO" }
+    );
+}
+
+fn inspect_tpf3_header(header: &Tpf3Header) {
+    println!("\n[+] Parsed TPF3 header:");
+    println!("    Version: {}", header.version);
+    println!("    Cipher Suite: {}", header.cipher_name());
+    println!("    KDF: {}", header.kdf_name());
+    println!("    Wrap Mode: {}", header.wrap_mode_name());
+    println!("    Argon2id Memory Cost: {} KiB", header.kdf_m);
+    println!("    Argon2id Time Cost: {} iterations", header.kdf_t);
+    println!("    Argon2id Parallelism: {} lane(s)", header.kdf_p);
+    println!("    Nonce Length: {} bytes", header.nonce.len());
+    println!("    Wrapped Key Length: {} bytes", header.wrapped_key.len());
+    println!("    KEM Ciphertext Length: {} bytes", header.kem_ciphertext.len());
+    println!("    TPM Policy Length: {} bytes", header.tpm_policy.len());
+    println!("    Payload Offset: {} bytes", header.body_offset());
+}
+
+fn secure_teardown(startup_buffer: &mut [u8]) {
+    let _ = win32::wipe_clipboard();
+    let _ = win32::unlock_memory(startup_buffer);
+}
+
+fn encrypt_tpf2_flow() {
+    println!("\n[*] Encrypting legacy-compatible TPF2 vault");
+    let input_path = prompt_input("  -> Enter path to plaintext file: ");
+    let output_path = prompt_input("  -> Enter destination vault path (.tpf2): ");
+
+    let dataset_hash = match load_optional_dataset_hash(true) {
+        Ok(hash) => hash,
+        Err(_) => return,
+    };
+
+    let wipe_source = prompt_yes_no(
+        "  -> Securely overwrite the plaintext source after encryption? (y/n): ",
+    );
+    let passphrase = prompt_passphrase();
+
+    println!("[*] Reading plaintext file...");
+    let plaintext = match fs::read(&input_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[!] Failed to read input file: {e}");
+            return;
+        }
+    };
+
+    let mut os_salt = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    thread_rng().fill_bytes(&mut os_salt);
+    thread_rng().fill_bytes(&mut nonce);
+
+    let header = Tpf2Header::new_v2(
+        0,
+        DEFAULT_KDF_M_COST,
+        DEFAULT_KDF_T_COST,
+        DEFAULT_KDF_P_COST,
+        0,
+        os_salt,
+        nonce,
+    );
+
+    println!("[*] Deriving vault key...");
+    let vault_key = match crypto::derive_vault_key(&passphrase, dataset_hash, &header) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[!] Key derivation failed: {e}");
+            return;
+        }
+    };
+
+    println!("[*] Encrypting payload...");
+    match crypto::encrypt_payload(&vault_key, &header, &plaintext) {
+        Ok(ciphertext) => {
+            let mut vault_data = header.as_bytes();
+            vault_data.extend(ciphertext);
+
+            if let Err(e) = fs::write(&output_path, vault_data) {
+                eprintln!("[!] Failed to write vault to disk: {e}");
+                return;
+            }
+
+            println!("[+] TPF2 vault created successfully.");
+        }
+        Err(e) => {
+            eprintln!("[!] Encryption failed: {e}");
+            return;
+        }
+    }
+
+    if wipe_source {
+        println!("[*] Securely overwriting source file...");
+        if let Err(e) = shred::secure_erase(std::path::Path::new(&input_path)) {
+            eprintln!("[!] Secure erase failed: {e}");
+        } else {
+            println!("[+] Source file removed.");
+        }
+    }
+}
+
+fn encrypt_tpf3_flow() {
+    println!("\n[*] Encrypting TPF3 vault");
+    let input_path = prompt_input("  -> Enter path to plaintext file: ");
+    let output_path = prompt_input("  -> Enter destination vault path (.tpf3): ");
+
+    let cipher_suite = match select_cipher_suite() {
+        Some(suite) => suite,
+        None => return,
+    };
+
+    println!("\nSelect wrap mode:");
+    println!("1. Direct/local derivation (implemented)");
+    println!("2. TPM-wrapped content key (provisioning available, wrap path pending)");
+    println!("3. ML-KEM-768 wrapped content key (pending)");
+
+    let wrap_mode = match prompt_input("Choice: ").as_str() {
+        "1" => KeyWrapMode::None,
+        "2" => {
+            println!("[!] TPM-wrapped vault creation is not wired yet.");
+            println!("[*] Use the TPM provisioning menu option to create/check the TPM key first.");
+            return;
+        }
+        "3" => {
+            println!("[!] ML-KEM-768 wrapped vault creation is not wired yet.");
+            return;
+        }
+        _ => {
+            eprintln!("[!] Invalid wrap mode selection.");
+            return;
+        }
+    };
+
+    let dataset_hash = match load_optional_dataset_hash(true) {
+        Ok(hash) => hash,
+        Err(_) => return,
+    };
+
+    let wipe_source = prompt_yes_no(
+        "  -> Securely overwrite the plaintext source after encryption? (y/n): ",
+    );
+    let passphrase = prompt_passphrase();
+
+    println!("[*] Reading plaintext file...");
+    let plaintext = match fs::read(&input_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[!] Failed to read input file: {e}");
+            return;
+        }
+    };
+
+    let mut os_salt = [0u8; 32];
+    thread_rng().fill_bytes(&mut os_salt);
+    let nonce = crypto::generate_tpf3_nonce(cipher_suite);
+
+    let header = match Tpf3Header::new_v3(
+        0,
+        cipher_suite,
+        wrap_mode,
+        DEFAULT_KDF_M_COST,
+        DEFAULT_KDF_T_COST,
+        DEFAULT_KDF_P_COST,
+        os_salt,
+        nonce,
+        vec![],
+        vec![],
+        vec![],
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[!] Failed to build TPF3 header: {e}");
+            return;
+        }
+    };
+
+    println!("[*] Deriving TPF3 content key...");
+    let content_key = match crypto::derive_tpf3_content_key(&passphrase, dataset_hash, &header) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[!] Key derivation failed: {e}");
+            return;
+        }
+    };
+
+    println!("[*] Encrypting payload...");
+    let header_bytes = match header.as_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[!] Failed to serialize TPF3 header: {e}");
+            return;
+        }
+    };
+
+    match crypto::encrypt_tpf3_payload(&content_key, &header, &plaintext) {
+        Ok(ciphertext) => {
+            let mut vault_data = header_bytes;
+            vault_data.extend(ciphertext);
+
+            if let Err(e) = fs::write(&output_path, vault_data) {
+                eprintln!("[!] Failed to write vault to disk: {e}");
+                return;
+            }
+
+            println!("[+] TPF3 vault created successfully.");
+        }
+        Err(e) => {
+            eprintln!("[!] Encryption failed: {e}");
+            return;
+        }
+    }
+
+    if wipe_source {
+        println!("[*] Securely overwriting source file...");
+        if let Err(e) = shred::secure_erase(std::path::Path::new(&input_path)) {
+            eprintln!("[!] Secure erase failed: {e}");
+        } else {
+            println!("[+] Source file removed.");
+        }
+    }
+}
+
+fn decrypt_vault_flow() {
+    println!("\n[*] Decryption");
+    let input_path = prompt_input("  -> Enter path to vault file: ");
+    let output_path = prompt_input("  -> Enter destination plaintext path: ");
+
+    let vault_data = match fs::read(&input_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[!] Failed to read vault file: {e}");
+            return;
+        }
+    };
+
+    let parsed = match parse_vault_header(&vault_data) {
+        Ok(header) => header,
+        Err(e) => {
+            eprintln!("[!] Failed to parse vault header: {e}");
+            return;
+        }
+    };
+
+    match parsed {
+        ParsedVaultHeader::Tpf2(header) => {
+            inspect_tpf2_header(&header);
+
+            let dataset_hash = match load_optional_dataset_hash(false) {
+                Ok(hash) => hash,
+                Err(_) => return,
+            };
+
+            let passphrase = prompt_passphrase();
+            let ciphertext = &vault_data[format::HEADER_SIZE..];
+
+            println!("[*] Deriving legacy vault key...");
+            let vault_key = match crypto::derive_vault_key(&passphrase, dataset_hash, &header) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[!] Key derivation failed: {e}");
+                    return;
+                }
+            };
+
+            println!("[*] Decrypting and verifying authentication tag...");
+            match crypto::decrypt_payload(&vault_key, &header, ciphertext) {
+                Ok(plaintext) => {
+                    if let Err(e) = fs::write(&output_path, plaintext) {
+                        eprintln!("[!] Failed to write plaintext to disk: {e}");
+                        return;
+                    }
+                    println!("[+] TPF2 vault decrypted successfully.");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[!] Decryption failed. Check the passphrase, dataset selection, or file integrity."
+                    );
+                    return;
+                }
+            }
+        }
+
+        ParsedVaultHeader::Tpf3(header) => {
+            inspect_tpf3_header(&header);
+
+            if header.wrap_mode != KeyWrapMode::None {
+                eprintln!(
+                    "[!] This TPF3 vault uses {}, but wrapped-key decryption is not wired in this build yet.",
+                    header.wrap_mode_name()
+                );
+                return;
+            }
+
+            let dataset_hash = match load_optional_dataset_hash(false) {
+                Ok(hash) => hash,
+                Err(_) => return,
+            };
+
+            let passphrase = prompt_passphrase();
+            let body_offset = header.body_offset();
+            if vault_data.len() < body_offset {
+                eprintln!("[!] Vault payload offset is invalid.");
+                return;
+            }
+
+            let ciphertext = &vault_data[body_offset..];
+
+            println!("[*] Deriving TPF3 content key...");
+            let content_key = match crypto::derive_tpf3_content_key(&passphrase, dataset_hash, &header)
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[!] Key derivation failed: {e}");
+                    return;
+                }
+            };
+
+            println!("[*] Decrypting and verifying authentication tag...");
+            match crypto::decrypt_tpf3_payload(&content_key, &header, ciphertext) {
+                Ok(plaintext) => {
+                    if let Err(e) = fs::write(&output_path, plaintext) {
+                        eprintln!("[!] Failed to write plaintext to disk: {e}");
+                        return;
+                    }
+                    println!("[+] TPF3 vault decrypted successfully.");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[!] Decryption failed. Check the passphrase, dataset selection, cipher choice, or file integrity."
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    if let Err(_) = win32::wipe_clipboard() {
+        eprintln!("[WARNING] Failed to clear the Windows clipboard.");
+    } else {
+        println!("[+] Clipboard cleared.");
+    }
+}
+
+fn inspect_vault_flow() {
+    println!("\n[*] Header inspection");
+    let input_path = prompt_input("  -> Enter path to vault file: ");
+
+    let vault_data = match fs::read(&input_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[!] Failed to read vault file: {e}");
+            return;
+        }
+    };
+
+    match parse_vault_header(&vault_data) {
+        Ok(ParsedVaultHeader::Tpf2(header)) => inspect_tpf2_header(&header),
+        Ok(ParsedVaultHeader::Tpf3(header)) => inspect_tpf3_header(&header),
+        Err(e) => eprintln!("[!] Failed to parse header: {e}"),
+    }
+}
+
+fn check_tpm_provider_flow() {
+    println!("\n[*] Checking TPM provider...");
+    if win32::tpm_provider_available() {
+        println!("[+] Microsoft Platform Crypto Provider is available.");
+    } else {
+        println!("[!] TPM provider is not available on this system.");
+    }
+}
+
+fn provision_tpm_key_flow() {
+    println!("\n[*] TPM key provisioning");
+    let alias = prompt_input("  -> Enter TPM key alias: ");
+    let scope = match select_tpm_scope() {
+        Some(scope) => scope,
+        None => return,
+    };
+
+    println!("[*] Ensuring TPM key exists for scope {}...", scope.label());
+    match win32::ensure_tpm_rsa_key(&alias, scope) {
+        Ok(()) => println!("[+] TPM RSA key is available under alias '{}'.", alias),
+        Err(e) => eprintln!("[!] TPM key provisioning failed: {e}"),
+    }
 }
 
 fn main() {
@@ -43,16 +523,22 @@ fn main() {
 
     let mut startup_buffer = [0u8; 32];
     if let Err(e) = win32::lock_memory(&mut startup_buffer) {
-        eprintln!("[WARNING] OS Memory Lock failed: {}. Ensure you have the right permissions.", e);
+        eprintln!(
+            "[WARNING] Memory locking failed: {}. Continue only on a trusted host.",
+            e
+        );
     }
 
     loop {
-        println!("\n=== TRIPLE PULSAR VAULT (Windows Edition) ===");
-        println!("1. Encrypt File");
-        println!("2. Decrypt Vault");
-        println!("3. Inspect Vault Header");
-        println!("4. Secure Exit");
-        println!("0. Self-Destruct (Emergency Wipe & Exit)");
+        println!("=== TripplePulsar Vault 3.0 ===");
+        println!("1. Encrypt legacy-compatible TPF2 vault");
+        println!("2. Encrypt modern TPF3 vault");
+        println!("3. Decrypt vault");
+        println!("4. Inspect vault header");
+        println!("5. Check TPM provider");
+        println!("6. Provision TPM RSA key");
+        println!("7. Secure exit");
+        println!("0. Emergency exit");
         print!("Select an option: ");
         io::stdout().flush().unwrap();
 
@@ -60,219 +546,29 @@ fn main() {
         io::stdin().read_line(&mut choice).unwrap();
 
         match choice.trim() {
-            "1" => {
-                println!("\n[*] ENCRYPTION SEQUENCE");
-                let input_str = prompt_input("  -> Enter path to plaintext file: ");
-                let output_str = prompt_input("  -> Enter destination vault path (.tpf2): ");
-                
-                let use_pulsar = prompt_input("  -> Use Pulsar dataset for extreme entropy? (y/n): ");
-                let mut dataset_hash = None;
-                if use_pulsar.to_lowercase() == "y" {
-                    let ds_str = prompt_input("  -> Enter path to Pulsar dataset (e.g., mock_pulsar.csv): ");
-                    println!("[*] Streaming dataset through BLAKE3...");
-                    match crypto::hash_pulsar_dataset(&ds_str) {
-                        Ok(h) => {
-                            dataset_hash = Some(h);
-                            println!("[+] Dataset hashed successfully.");
-                        },
-                        Err(e) => {
-                            eprintln!("[!] Failed to read dataset: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                
-                let wipe_choice = prompt_input("  -> Perform DoD 2-pass wipe on plaintext source after encryption? (y/n): ");
-                let passphrase = prompt_passphrase();
-
-                println!("[*] Reading plaintext file...");
-                let plaintext = match fs::read(&input_str) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("[!] Failed to read input file: {}", e);
-                        continue;
-                    }
-                };
-
-                // Generate 32-byte OS Salt and 12-byte Nonce
-                let mut os_salt = [0u8; 32];
-                let mut nonce = [0u8; 12];
-                thread_rng().fill_bytes(&mut os_salt);
-                thread_rng().fill_bytes(&mut nonce);
-
-                println!("[*] Deriving Argon2id Master Key (This may take a moment)...");
-                // 262144 KB = 256 MB RAM, 3 iterations, 1 parallelism lane
-                let master_key = match crypto::derive_master_key(&passphrase, dataset_hash, &os_salt, 262144, 3, 1) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("[!] Key derivation failed: {}", e);
-                        continue;
-                    }
-                };
-
-                let header = format::Tpf2Header {
-                    magic: *format::MAGIC_BYTES,
-                    version: format::CURRENT_VERSION,
-                    flags: 0,
-                    alg_id: 0, // AES-256-GCM
-                    kdf_id: 0, // Argon2id
-                    kdf_m: 262144,
-                    kdf_t: 3,
-                    kdf_p: 1,
-                    tpm_flag: 0,
-                    reserved: [0; 2],
-                    os_salt,
-                    nonce,
-                };
-
-                println!("[*] Encrypting payload with AES-256-GCM...");
-                match crypto::encrypt_payload(&master_key, &header, &plaintext) {
-                    Ok(ciphertext) => {
-                        let mut vault_data = header.as_bytes();
-                        vault_data.extend(ciphertext);
-                        if let Err(e) = fs::write(&output_str, vault_data) {
-                            eprintln!("[!] Failed to write vault to disk: {}", e);
-                            continue;
-                        }
-                        println!("\n[+] Cryptographic core engaged. Vault secured successfully!");
-                    },
-                    Err(e) => {
-                        eprintln!("[!] Encryption failed: {}", e);
-                        continue;
-                    }
-                }
-
-                if wipe_choice.to_lowercase() == "y" {
-                    println!("[*] Initiating DoD secure wipe on source file...");
-                    if let Err(e) = shred::secure_erase(std::path::Path::new(&input_str)) {
-                        eprintln!("[!] Shredding failed: {}", e);
-                    } else {
-                        println!("[+] Source file securely obliterated from physical disk.");
-                    }
-                }
-            }
-            "2" => {
-                println!("\n[*] DECRYPTION SEQUENCE");
-                let input_str = prompt_input("  -> Enter path to vault file: ");
-                let output_str = prompt_input("  -> Enter destination plaintext path: ");
-                
-                let use_pulsar = prompt_input("  -> Was a Pulsar dataset used to encrypt this? (y/n): ");
-                let mut dataset_hash = None;
-                if use_pulsar.to_lowercase() == "y" {
-                    let ds_str = prompt_input("  -> Enter path to exact Pulsar dataset: ");
-                    println!("[*] Streaming dataset through BLAKE3...");
-                    match crypto::hash_pulsar_dataset(&ds_str) {
-                        Ok(h) => dataset_hash = Some(h),
-                        Err(e) => {
-                            eprintln!("[!] Failed to read dataset: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                
-                let passphrase = prompt_passphrase();
-                
-                let vault_data = match fs::read(&input_str) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("[!] Failed to read vault file: {}", e);
-                        continue;
-                    }
-                };
-
-                if vault_data.len() < format::HEADER_SIZE {
-                    eprintln!("[!] File is too small to be a valid TPF2 vault.");
-                    continue;
-                }
-
-                println!("[*] Parsing TPF2 Header...");
-                let header = match format::Tpf2Header::from_bytes(&vault_data[..format::HEADER_SIZE]) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("[!] Header validation failed: {}", e);
-                        continue;
-                    }
-                };
-
-                let ciphertext = &vault_data[format::HEADER_SIZE..];
-
-                println!("[*] Deriving Argon2id Master Key (Reconstructing from header parameters)...");
-                let master_key = match crypto::derive_master_key(
-                    &passphrase, 
-                    dataset_hash, 
-                    &header.os_salt, 
-                    header.kdf_m, 
-                    header.kdf_t as u32, 
-                    header.kdf_p as u32
-                ) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("[!] Key derivation failed: {}", e);
-                        continue;
-                    }
-                };
-
-                println!("[*] Decrypting and verifying MAC tag...");
-                match crypto::decrypt_payload(&master_key, &header, ciphertext) {
-                    Ok(plaintext) => {
-                        if let Err(e) = fs::write(&output_str, plaintext) {
-                            eprintln!("[!] Failed to write plaintext to disk: {}", e);
-                            continue;
-                        }
-                        println!("\n[+] Integrity verified. Payload decrypted successfully!");
-                    },
-                    Err(_) => {
-                        eprintln!("\n[!] FATAL: Decryption failed. Incorrect passphrase, wrong dataset, or file was tampered with.");
-                        continue;
-                    }
-                }
-                
-                if let Err(_) = win32::wipe_clipboard() {
-                    eprintln!("[WARNING] Failed to securely wipe the Windows clipboard.");
-                } else {
-                    println!("[+] Windows clipboard securely wiped.");
-                }
-            }
-            "3" => {
-                println!("\n[*] VAULT INSPECTION");
-                let input_str = prompt_input("  -> Enter path to vault file: ");
-                
-                let vault_data = match fs::read(&input_str) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("[!] Failed to read vault file: {}", e);
-                        continue;
-                    }
-                };
-
-                match format::Tpf2Header::from_bytes(&vault_data) {
-                    Ok(h) => {
-                        println!("\n[+] TPF2 Header parsed successfully:");
-                        println!("    Version: {}", h.version);
-                        println!("    Algorithm ID: {} (AES-GCM)", h.alg_id);
-                        println!("    Argon2id Memory Cost: {} KB", h.kdf_m);
-                        println!("    Argon2id Time Cost: {} iterations", h.kdf_t);
-                        println!("    Argon2id Parallelism: {} lanes", h.kdf_p);
-                        println!("    Hardware TPM Bound: {}", if h.tpm_flag == 1 { "YES" } else { "NO" });
-                    },
-                    Err(e) => eprintln!("[!] Failed to parse header: {}", e),
-                }
-            }
-            "4" => {
-                println!("\n[*] Initiating Secure Exit...");
+            "1" => encrypt_tpf2_flow(),
+            "2" => encrypt_tpf3_flow(),
+            "3" => decrypt_vault_flow(),
+            "4" => inspect_vault_flow(),
+            "5" => check_tpm_provider_flow(),
+            "6" => provision_tpm_key_flow(),
+            "7" => {
+                println!("\n[*] Performing secure exit...");
+                secure_teardown(&mut startup_buffer);
+                println!("[+] Session closed.");
                 break;
             }
             "0" => {
-                println!("\n[!] EMERGENCY SELF-DESTRUCT INITIATED [!]");
-                let _ = win32::wipe_clipboard();
-                let _ = win32::unlock_memory(&mut startup_buffer);
-                println!("[+] RAM unpinned. Clipboard scrubbed. Terminating instantly.");
+                println!("\n[!] Emergency exit requested.");
+                secure_teardown(&mut startup_buffer);
+                println!("[+] Teardown complete.");
                 std::process::exit(0);
             }
-            _ => println!("[!] Invalid option. Please select an option from 0 to 4."),
+            _ => {
+                println!("[!] Invalid option. Please select an option from 0 to 7.");
+            }
         }
+
+        println!();
     }
-    
-    let _ = win32::unlock_memory(&mut startup_buffer);
-    println!("[+] Cryptographic teardown sequence complete. Stay safe.");
 }

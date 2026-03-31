@@ -1,161 +1,311 @@
-# TPF2 Vault File Format Specification
+# TPF2 / TPF3 Vault File Format Specification
 
-TripplePulsar Vault stores encrypted data using the **TPF2 (TripplePulsar File Format v2)** container format.
+TripplePulsar Vault currently supports two on-disk container families:
 
-This document describes the binary layout of the vault file and how encryption metadata is structured.
+- **TPF2** for legacy and TPV 2.0-compatible vaults
+- **TPF3** for the modern extensible format used by TPV 3.0
 
-The format is intentionally simple and deterministic to support:
+This document reflects the **current codebase** and is intended to match the active Rust implementation.
 
-• secure parsing  
-• version upgrades  
-• forward compatibility  
-• forensic inspection tools  
+---
 
-# File Layout Overview
+## 1. Format Selection
 
-A `.tpf2` vault is composed of three sections:
+Vault parsing is selected by the first four bytes of the file:
 
-    +-------------------+
-    | Header (62 bytes) |
-    +-------------------+
-    | Ciphertext |
-    +-------------------+
-    | GCM Tag (16B) |
-    +-------------------+
-    
-    
-The header contains all information required to reconstruct the key derivation parameters needed to decrypt the vault.
+- `TPF2` → parse as `Tpf2Header`
+- `TPF3` → parse as `Tpf3Header`
 
-# Header Layout
+If neither magic value is present, parsing fails.
 
-Total Size: **62 bytes**
+---
 
-| Offset | Size | Field | Description |
-|------|------|------|-------------|
-| 0 | 4 | magic | ASCII `"TPF2"` file signature |
-| 4 | 1 | version | Vault format version |
-| 5 | 1 | flags | Feature flags |
-| 6 | 1 | alg_id | Encryption algorithm identifier |
-| 7 | 1 | kdf_id | Key derivation function identifier |
-| 8 | 4 | kdf_m | Argon2 memory cost (KiB) |
-| 12 | 4 | kdf_t | Argon2 iteration count |
-| 16 | 1 | kdf_p | Argon2 parallelism |
-| 17 | 1 | tpm_flag | Reserved for TPM hardware binding |
-| 18 | 8 | reserved | Reserved for future use |
-| 26 | 16 | os_salt | Random salt used for key derivation |
-| 42 | 12 | nonce | AES-GCM nonce |
-| 54 | 8 | reserved2 | Reserved expansion space |
+## 2. TPF2 Overview
 
+TPF2 is the compact legacy-compatible format.
 
-# Algorithm Identifiers
+### File Layout
 
-## Encryption Algorithms
+A `.tpf2` vault is:
 
-| ID | Algorithm |
+```text
++-------------------+
+| Header (62 bytes) |
++-------------------+
+| AEAD payload      |
++-------------------+
+```
+
+The AEAD payload is the output returned by AES-256-GCM. In practice this is the encrypted plaintext with the authentication tag appended by the AEAD implementation.
+
+### Supported Versions
+
+- **v1**: legacy vaults
+- **v2**: current TPV 2.0 vaults
+
+### Fixed Header Size
+
+`62 bytes`
+
+### TPF2 Header Layout
+
+| Offset | Size | Field | Type | Notes |
+|---|---:|---|---|---|
+| 0 | 4 | `magic` | bytes | ASCII `TPF2` |
+| 4 | 1 | `version` | u8 | `1` for legacy, `2` for current |
+| 5 | 1 | `flags` | u8 | feature flags |
+| 6 | 1 | `alg_id` | u8 | canonical value `1` = AES-256-GCM |
+| 7 | 1 | `kdf_id` | u8 | canonical value `1` = Argon2id |
+| 8 | 4 | `kdf_m` | u32 LE | Argon2 memory cost in KiB |
+| 12 | 2 | `kdf_t` | u16 LE | Argon2 time cost |
+| 14 | 1 | `kdf_p` | u8 | Argon2 parallelism |
+| 15 | 1 | `tpm_flag` | u8 | reserved TPM indicator |
+| 16 | 2 | `reserved` | bytes | reserved, currently zeroed |
+| 18 | 32 | `os_salt` | bytes | random salt |
+| 50 | 12 | `nonce` | bytes | AES-GCM nonce |
+
+### Algorithm Identifiers
+
+#### Encryption
+
+| ID | Meaning |
 |---|---|
 | 1 | AES-256-GCM |
 
-Future versions may support additional AEAD ciphers.
+The parser also tolerates `0` for compatibility, but newly created vaults write the canonical value `1`.
 
+#### KDF
 
-## Key Derivation Functions
-
-| ID | KDF |
+| ID | Meaning |
 |---|---|
 | 1 | Argon2id |
 
+The parser also tolerates `0` for compatibility, but newly created vaults write the canonical value `1`.
 
-# Key Derivation Procedure
+### Key Derivation
 
-To reconstruct the encryption key, the following procedure is used:
+TPF2 supports two key schedules depending on header version.
 
+#### TPF2 v1
 
-    dataset_hash = BLAKE3(dataset_file)
+Legacy vaults use the direct Argon2id output as the AES-256-GCM key.
 
-    IKM = passphrase || dataset_hash
+```text
+dataset_hash = optional BLAKE3(dataset)
+IKM = passphrase || dataset_hash
+vault_key = Argon2id(IKM, os_salt, kdf_m, kdf_t, kdf_p)
+```
 
-    derived_key = Argon2id(
-    input = IKM,
-    salt = os_salt,
-    memory = kdf_m,
-    iterations = kdf_t,
-    parallelism = kdf_p
-    )
-    
-    
-If no dataset was used during encryption, the dataset hash component is omitted.
+#### TPF2 v2
 
+Current TPV 2.0 vaults derive a 32-byte Argon2id root key and then expand the actual encryption key with HKDF-SHA256.
 
-# Authenticated Encryption
+```text
+dataset_hash = optional BLAKE3(dataset)
+IKM = passphrase || dataset_hash
+root_key = Argon2id(IKM, os_salt, kdf_m, kdf_t, kdf_p)
+vault_key = HKDF-SHA256(
+  salt = os_salt,
+  ikm = root_key,
+  info = "TPV2:ENC:AES-256-GCM"
+)
+```
 
-Vault payloads are encrypted using **AES-256-GCM**.
+### Authenticated Encryption
 
-The encryption process includes the vault header as **Associated Authenticated Data (AAD)**:
+TPF2 uses **AES-256-GCM**.
 
+The serialized 62-byte header is bound as **Associated Authenticated Data (AAD)**:
 
-    ciphertext, tag = AES256_GCM_Encrypt(
-    key = derived_key,
-    nonce = nonce,
-    plaintext = file_data,
-    AAD = header_bytes
-    )
-    
-    
-This ensures that any modification to header fields invalidates the authentication tag.
+```text
+payload = AES-256-GCM-Encrypt(
+  key = vault_key,
+  nonce = nonce,
+  plaintext = file_data,
+  aad = header_bytes
+)
+```
 
+Any modification to the header or encrypted payload causes authentication failure during decryption.
 
-# Ciphertext Section
+---
 
-The ciphertext section contains the encrypted form of the original file contents.
+## 3. TPF3 Overview
 
-The ciphertext length is:
+TPF3 is the modern extensible format introduced for TPV 3.0. It adds:
 
-    ciphertext_length = file_size
-    
-AES-GCM does not expand ciphertext beyond the authentication tag.
+- multiple cipher suites
+- explicit key-wrap modes
+- variable-length header-attached blobs
+- a dedicated Argon2id + HKDF-SHA256 key schedule
 
-# Authentication Tag
+### File Layout
 
-The vault concludes with the **16-byte AES-GCM authentication tag**.
+A `.tpf3` vault is:
 
-This tag verifies both:
+```text
++---------------------------+
+| Fixed header (56 bytes)   |
++---------------------------+
+| nonce                     |
++---------------------------+
+| wrapped_key               |
++---------------------------+
+| kem_ciphertext            |
++---------------------------+
+| tpm_policy                |
++---------------------------+
+| AEAD payload              |
++---------------------------+
+```
 
-• ciphertext integrity  
-• header integrity  
+The payload begins at:
 
-If verification fails, the vault **must not be decrypted**.
+```text
+body_offset = 56 + nonce_len + wrapped_key_len + kem_ct_len + tpm_policy_len
+```
 
-# Forward Compatibility
+### Fixed Header Size
 
-The header includes reserved fields to allow future expansion without breaking existing parsers.
+`56 bytes`
 
-Planned extensions include:
+### TPF3 Fixed Header Layout
 
-• TPM hardware binding metadata  
-• dataset fingerprint storage  
-• algorithm agility fields  
+| Offset | Size | Field | Type | Notes |
+|---|---:|---|---|---|
+| 0 | 4 | `magic` | bytes | ASCII `TPF3` |
+| 4 | 1 | `version` | u8 | currently `1` |
+| 5 | 2 | `flags` | u16 LE | feature flags |
+| 7 | 1 | `cipher_id` | u8 | cipher suite |
+| 8 | 1 | `kdf_id` | u8 | KDF identifier |
+| 9 | 1 | `wrap_mode` | u8 | key-wrap mode |
+| 10 | 1 | `nonce_len` | u8 | bytes in nonce blob |
+| 11 | 2 | `wrapped_key_len` | u16 LE | bytes in wrapped key blob |
+| 13 | 2 | `kem_ct_len` | u16 LE | bytes in KEM ciphertext blob |
+| 15 | 2 | `tpm_policy_len` | u16 LE | bytes in TPM policy blob |
+| 17 | 4 | `kdf_m` | u32 LE | Argon2 memory cost in KiB |
+| 21 | 2 | `kdf_t` | u16 LE | Argon2 time cost |
+| 23 | 1 | `kdf_p` | u8 | Argon2 parallelism |
+| 24 | 32 | `os_salt` | bytes | random salt |
 
-Future versions will increment the **version field** while maintaining backward compatibility where possible.
+### Variable-Length Blob Order
 
-# Security Considerations
+Immediately after the fixed header, the following blobs are serialized in this order:
 
-Developers implementing TPF2 parsers should:
+1. `nonce`
+2. `wrapped_key`
+3. `kem_ciphertext`
+4. `tpm_policy`
 
-• validate the magic value before parsing  
-• reject unsupported version numbers  
-• enforce strict header size checks  
-• avoid unsafe memory parsing techniques  
-• verify authentication tags before returning plaintext  
+### Cipher Suite Identifiers
 
-Failure to enforce these rules may lead to parsing vulnerabilities.
+| ID | Meaning | Nonce Length |
+|---|---|---:|
+| 1 | AES-256-GCM | 12 |
+| 2 | XChaCha20-Poly1305 | 24 |
 
-# Summary
+### KDF Identifiers
 
-The TPF2 format provides a compact, deterministic container for encrypted files using modern authenticated encryption and memory-hard key derivation.
+| ID | Meaning |
+|---|---|
+| 1 | Argon2id + HKDF-SHA256 |
 
-Its design emphasizes:
+### Wrap Mode Identifiers
 
-• simplicity  
-• strong integrity guarantees  
-• forward compatibility  
-• safe parsing behavior
+| ID | Meaning |
+|---|---|
+| 0 | None |
+| 1 | TPM-wrapped key |
+| 2 | ML-KEM-768 wrapped key |
+
+### TPF3 Validation Rules
+
+The implementation validates the following:
+
+- nonce length must match the selected cipher suite
+- `wrap_mode = None` requires empty `kem_ciphertext` and empty `tpm_policy`
+- `wrap_mode = TpmWrapped` requires a non-empty `wrapped_key` and an empty `kem_ciphertext`
+- `wrap_mode = MlKem768` requires non-empty `wrapped_key` and non-empty `kem_ciphertext`, and an empty `tpm_policy`
+
+### Key Derivation
+
+For the currently implemented **direct/local derivation** mode (`wrap_mode = None`):
+
+```text
+dataset_hash = optional BLAKE3(dataset)
+IKM = passphrase || dataset_hash
+root_key = Argon2id(IKM, os_salt, kdf_m, kdf_t, kdf_p)
+content_key = HKDF-SHA256(
+  salt = os_salt,
+  ikm = root_key,
+  info = cipher-specific label
+)
+```
+
+HKDF info labels currently used:
+
+- `TPF3:ENC:AES-256-GCM`
+- `TPF3:ENC:XCHACHA20-POLY1305`
+
+### Authenticated Encryption
+
+TPF3 binds the **entire serialized TPF3 header** as AAD.
+
+For AES-256-GCM:
+
+```text
+payload = AES-256-GCM-Encrypt(
+  key = content_key,
+  nonce = nonce,
+  plaintext = file_data,
+  aad = serialized_tpf3_header
+)
+```
+
+For XChaCha20-Poly1305:
+
+```text
+payload = XChaCha20-Poly1305-Encrypt(
+  key = content_key,
+  nonce = nonce,
+  plaintext = file_data,
+  aad = serialized_tpf3_header
+)
+```
+
+---
+
+## 4. Current Implementation Status
+
+### Implemented
+
+- TPF2 encrypt / decrypt / inspect
+- TPF3 encrypt / decrypt / inspect
+- TPF3 direct/local derivation (`wrap_mode = None`)
+- TPF3 AES-256-GCM
+- TPF3 XChaCha20-Poly1305
+- TPM provider detection and TPM RSA key provisioning utilities
+
+### Defined in Format, Not Yet Wired End-to-End
+
+- TPF3 TPM-wrapped content key encryption/decryption
+- TPF3 ML-KEM-768 wrapped content key encryption/decryption
+
+The format reserves space for wrapped-key metadata today, but the current CLI only performs full TPF3 encryption/decryption for direct/local derivation mode.
+
+---
+
+## 5. Security Notes
+
+- If a dataset is used during encryption, the same dataset must be supplied during decryption.
+- Authentication must be verified before returning plaintext.
+- Header fields are authenticated through AEAD AAD binding.
+- Overwrite-based deletion is best-effort only and is not guaranteed on SSDs or other wear-leveling storage.
+
+---
+
+## 6. Summary
+
+TPF2 remains the compact backward-compatible vault format, while TPF3 provides the forward-looking extensible container for TPV 3.0.
+
+The current codebase supports both formats and dispatches parsing strictly by file magic.
