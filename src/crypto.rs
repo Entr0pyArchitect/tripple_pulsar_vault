@@ -12,18 +12,29 @@ use blake3::Hasher;
 #[cfg(feature = "cipher-xchacha20poly1305")]
 use chacha20poly1305::{Key as XChaChaKey, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+#[cfg(feature = "pq-mlkem768")]
+use ml_kem::kem::{
+    Decapsulate, DecapsulationKey as MlKemDecapsulationKey, Encapsulate,
+    EncapsulationKey as MlKemEncapsulationKey,
+};
+#[cfg(feature = "pq-mlkem768")]
+use ml_kem::{Ciphertext as MlKemCiphertext, Encoded, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use rand::{thread_rng, RngCore};
 use secrecy::{ExposeSecret, Secret};
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::format::{CipherSuite, FormatError, Tpf2Header, Tpf3Header};
+use crate::format::{CipherSuite, FormatError, KeyWrapMode, Tpf2Header, Tpf3Header};
+use crate::win32::{self, TpmKeyScope, Win32Error};
 
 const ROOT_KEY_LEN: usize = 32;
 const V2_ENC_INFO: &[u8] = b"TPV2:ENC:AES-256-GCM";
 const TPF3_AES_ENC_INFO: &[u8] = b"TPF3:ENC:AES-256-GCM";
 const TPF3_XCHACHA_ENC_INFO: &[u8] = b"TPF3:ENC:XCHACHA20-POLY1305";
+const TPF3_MLKEM_WRAP_INFO: &[u8] = b"TPF3:MLKEM768:KWK";
+const TPF3_MLKEM_WRAP_AAD: &[u8] = b"TPF3:MLKEM768:WRAP";
+const TPF3_MLKEM_WRAP_NONCE_LEN: usize = 12;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -32,6 +43,9 @@ pub enum CryptoError {
 
     #[error("Invalid vault header: {0}")]
     FormatError(#[from] FormatError),
+
+    #[error("Windows TPM operation failed: {0}")]
+    Win32Error(#[from] Win32Error),
 
     #[error("Argon2id key derivation failed")]
     KdfError,
@@ -42,6 +56,16 @@ pub enum CryptoError {
     #[cfg(not(feature = "cipher-xchacha20poly1305"))]
     #[error("Requested cipher suite is not enabled in this build: {0}")]
     CipherSuiteUnavailable(&'static str),
+
+    #[error("TPF3 wrap mode is not valid for this operation: {0}")]
+    InvalidWrapMode(&'static str),
+
+    #[cfg(feature = "pq-mlkem768")]
+    #[error("ML-KEM-768 operation failed")]
+    MlKemError,
+
+    #[error("Invalid wrapped-key blob")]
+    InvalidWrappedKeyBlob,
 
     #[error("Encryption/decryption failed: wrong key or tampered payload")]
     AeadError,
@@ -79,7 +103,8 @@ pub fn derive_master_key(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<Secret<Vec<u8>>, CryptoError> {
-    let root_key = derive_argon2_root_key(passphrase, dataset_hash, os_salt, m_cost, t_cost, p_cost)?;
+    let root_key =
+        derive_argon2_root_key(passphrase, dataset_hash, os_salt, m_cost, t_cost, p_cost)?;
     Ok(Secret::new(root_key))
 }
 
@@ -119,6 +144,16 @@ pub fn generate_tpf3_nonce(cipher_suite: CipherSuite) -> Vec<u8> {
     nonce
 }
 
+/// Generates a fresh random TPF3 content key for wrapped-key modes.
+///
+/// Current ciphers use 256-bit keys, so a 32-byte random content key is sufficient
+/// for both AES-256-GCM and XChaCha20-Poly1305.
+pub fn generate_tpf3_random_content_key(_cipher_suite: CipherSuite) -> Secret<Vec<u8>> {
+    let mut key = vec![0u8; ROOT_KEY_LEN];
+    thread_rng().fill_bytes(&mut key);
+    Secret::new(key)
+}
+
 /// Derives the content-encryption key for a direct-derivation TPF3 vault.
 ///
 /// Current build behavior:
@@ -141,6 +176,149 @@ pub fn derive_tpf3_content_key(
     let enc_key = expand_tpf3_content_key(&root_key, &header.os_salt, header.cipher_suite)?;
     root_key.zeroize();
     Ok(Secret::new(enc_key))
+}
+
+/// Wraps a randomly generated or caller-provided TPF3 content key using the TPM-backed RSA key.
+/// Returns:
+/// - wrapped key blob for `header.wrapped_key`
+/// - encoded TPM policy blob for `header.tpm_policy`
+pub fn tpm_wrap_tpf3_content_key(
+    content_key: &Secret<Vec<u8>>,
+    alias: &str,
+    scope: TpmKeyScope,
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    let wrapped_key = win32::tpm_wrap_key(alias, scope, content_key.expose_secret().as_slice())?;
+    let policy = win32::encode_tpm_policy(alias, scope)?;
+    Ok((wrapped_key, policy))
+}
+
+/// Recovers a TPM-wrapped TPF3 content key from the wrapped-key header fields.
+pub fn tpm_unwrap_tpf3_content_key(header: &Tpf3Header) -> Result<Secret<Vec<u8>>, CryptoError> {
+    if header.wrap_mode != KeyWrapMode::TpmWrapped {
+        return Err(CryptoError::InvalidWrapMode(
+            "TPM unwrap requested for a non-TPM-wrapped header",
+        ));
+    }
+
+    let (alias, scope) = win32::decode_tpm_policy(&header.tpm_policy)?;
+    let content_key = win32::tpm_unwrap_key(&alias, scope, &header.wrapped_key)?;
+    Ok(Secret::new(content_key))
+}
+
+
+#[cfg(feature = "pq-mlkem768")]
+pub fn generate_mlkem768_keypair_files(
+    public_key_path: &str,
+    private_key_path: &str,
+) -> Result<(), CryptoError> {
+    let mut rng = rand::thread_rng();
+    let (dk, ek): (
+        MlKemDecapsulationKey<MlKem768Params>,
+        MlKemEncapsulationKey<MlKem768Params>,
+    ) = MlKem768::generate(&mut rng);
+
+    std::fs::write(public_key_path, ek.as_bytes().as_slice())?;
+    std::fs::write(private_key_path, dk.as_bytes().as_slice())?;
+    Ok(())
+}
+
+#[cfg(feature = "pq-mlkem768")]
+pub fn mlkem768_wrap_tpf3_content_key(
+    content_key: &Secret<Vec<u8>>,
+    recipient_public_key_bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    let ek_encoded = Encoded::<MlKemEncapsulationKey<MlKem768Params>>::try_from(
+        recipient_public_key_bytes,
+    )
+    .map_err(|_| CryptoError::MlKemError)?;
+    let ek = MlKemEncapsulationKey::<MlKem768Params>::from_bytes(&ek_encoded);
+
+    let mut rng = rand::thread_rng();
+    let (ct, shared_secret) = ek
+        .encapsulate(&mut rng)
+        .map_err(|_| CryptoError::MlKemError)?;
+
+    let shared_secret_bytes: &[u8] = shared_secret.as_ref();
+    let hk = Hkdf::<Sha256>::new(None, shared_secret_bytes);
+    let mut kwk = vec![0u8; 32];
+    hk.expand(TPF3_MLKEM_WRAP_INFO, &mut kwk)
+        .map_err(|_| CryptoError::HkdfError)?;
+
+    let mut wrap_nonce = [0u8; TPF3_MLKEM_WRAP_NONCE_LEN];
+    thread_rng().fill_bytes(&mut wrap_nonce);
+
+    let key = Key::<Aes256Gcm>::from_slice(&kwk);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&wrap_nonce);
+
+    let wrapped = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: content_key.expose_secret().as_slice(),
+                aad: TPF3_MLKEM_WRAP_AAD,
+            },
+        )
+        .map_err(|_| CryptoError::AeadError)?;
+
+    kwk.zeroize();
+
+    let mut wrapped_key_blob =
+        Vec::with_capacity(TPF3_MLKEM_WRAP_NONCE_LEN + wrapped.len());
+    wrapped_key_blob.extend_from_slice(&wrap_nonce);
+    wrapped_key_blob.extend_from_slice(&wrapped);
+
+    let kem_ciphertext = ct.to_vec();
+    Ok((wrapped_key_blob, kem_ciphertext))
+}
+
+#[cfg(feature = "pq-mlkem768")]
+pub fn mlkem768_unwrap_tpf3_content_key(
+    wrapped_key_blob: &[u8],
+    kem_ciphertext_bytes: &[u8],
+    recipient_private_key_bytes: &[u8],
+) -> Result<Secret<Vec<u8>>, CryptoError> {
+    if wrapped_key_blob.len() <= TPF3_MLKEM_WRAP_NONCE_LEN {
+        return Err(CryptoError::InvalidWrappedKeyBlob);
+    }
+
+    let (wrap_nonce, wrapped_key) = wrapped_key_blob.split_at(TPF3_MLKEM_WRAP_NONCE_LEN);
+
+    let dk_encoded = Encoded::<MlKemDecapsulationKey<MlKem768Params>>::try_from(
+        recipient_private_key_bytes,
+    )
+    .map_err(|_| CryptoError::MlKemError)?;
+    let dk = MlKemDecapsulationKey::<MlKem768Params>::from_bytes(&dk_encoded);
+
+    let ct = MlKemCiphertext::<MlKem768>::try_from(kem_ciphertext_bytes)
+        .map_err(|_| CryptoError::MlKemError)?;
+
+    let shared_secret = dk
+        .decapsulate(&ct)
+        .map_err(|_| CryptoError::MlKemError)?;
+
+    let shared_secret_bytes: &[u8] = shared_secret.as_ref();
+    let hk = Hkdf::<Sha256>::new(None, shared_secret_bytes);
+    let mut kwk = vec![0u8; 32];
+    hk.expand(TPF3_MLKEM_WRAP_INFO, &mut kwk)
+        .map_err(|_| CryptoError::HkdfError)?;
+
+    let key = Key::<Aes256Gcm>::from_slice(&kwk);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(wrap_nonce);
+
+    let content_key = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: wrapped_key,
+                aad: TPF3_MLKEM_WRAP_AAD,
+            },
+        )
+        .map_err(|_| CryptoError::AeadError)?;
+
+    kwk.zeroize();
+    Ok(Secret::new(content_key))
 }
 
 /// Encrypts the payload using AES-256-GCM, binding the TPF2 header as AAD.
@@ -197,7 +375,9 @@ pub fn encrypt_tpf3_payload(
                 msg: plaintext,
                 aad: &header_bytes,
             };
-            cipher.encrypt(nonce, payload).map_err(|_| CryptoError::AeadError)
+            cipher
+                .encrypt(nonce, payload)
+                .map_err(|_| CryptoError::AeadError)
         }
         CipherSuite::XChaCha20Poly1305 => {
             encrypt_tpf3_xchacha20poly1305(content_key, header, plaintext, &header_bytes)
@@ -222,7 +402,9 @@ pub fn decrypt_tpf3_payload(
                 msg: ciphertext,
                 aad: &header_bytes,
             };
-            cipher.decrypt(nonce, payload).map_err(|_| CryptoError::AeadError)
+            cipher
+                .decrypt(nonce, payload)
+                .map_err(|_| CryptoError::AeadError)
         }
         CipherSuite::XChaCha20Poly1305 => {
             decrypt_tpf3_xchacha20poly1305(content_key, header, ciphertext, &header_bytes)
@@ -300,7 +482,9 @@ fn encrypt_tpf3_xchacha20poly1305(
         msg: plaintext,
         aad: header_bytes,
     };
-    cipher.encrypt(nonce, payload).map_err(|_| CryptoError::AeadError)
+    cipher
+        .encrypt(nonce, payload)
+        .map_err(|_| CryptoError::AeadError)
 }
 
 #[cfg(not(feature = "cipher-xchacha20poly1305"))]
@@ -327,7 +511,9 @@ fn decrypt_tpf3_xchacha20poly1305(
         msg: ciphertext,
         aad: header_bytes,
     };
-    cipher.decrypt(nonce, payload).map_err(|_| CryptoError::AeadError)
+    cipher
+        .decrypt(nonce, payload)
+        .map_err(|_| CryptoError::AeadError)
 }
 
 #[cfg(not(feature = "cipher-xchacha20poly1305"))]

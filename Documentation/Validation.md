@@ -1,28 +1,46 @@
 # TripplePulsar Vault (TPV) 3.0 — Validation Report
 
 Date generated: 2026-03-31
+Finalized after code and documentation update completion.
 
 ## Validation Summary
 
-The current TPV 3.0 repository was validated against the cleaned publication layout intended for GitHub.
+The current TPV 3.0 repository was validated against the finalized source and documentation set.
 
 Completed checks:
 
-- `cargo generate-lockfile` completed successfully
 - `cargo check` completed successfully
 - `cargo build --release` completed successfully
-- `cargo run` launched successfully and performed a clean secure exit
+- `cargo run` launched successfully
+- TPM provider check completed successfully from the interactive menu
+- secure exit completed successfully from the interactive menu
 - `cargo deny check` completed successfully with warnings only
 
-## Notes
+## Runtime Verification Notes
 
-Non-blocking warnings observed during `cargo deny check`:
+Observed interactive runtime path:
 
-- unmatched allowed licenses for `ISC` and `Zlib`
+1. Application launched successfully through `cargo run`
+2. Menu option `5` confirmed that the Microsoft Platform Crypto Provider is available
+3. Menu option `8` performed a clean secure exit
+
+## `cargo deny check` Result
+
+`cargo deny check` completed with:
+
+- `advisories ok`
+- `bans ok`
+- `licenses ok`
+- `sources ok`
+
+Non-blocking warnings observed:
+
+- unmatched allowed license entry: `ISC`
+- unmatched allowed license entry: `Zlib`
 - duplicate crate versions for `cpufeatures`
 - duplicate crate versions for `windows-sys`
 
-These warnings did not cause the advisories, bans, licenses, or sources checks to fail.
+These warnings did **not** cause the deny check to fail.
 
 ## Repository Scope
 
@@ -32,29 +50,39 @@ Excluded from this manifest:
 
 - `target/` build artifacts
 - temporary files and logs
-- `Documentation/Validation.md` itself, since it is regenerated from the hashes below
-- `Documentation/htru2.zip`
+- `Documentation\Validation.md` itself, since it is regenerated from the hashes below
+- `Documentation\htru2.zip`
 
 ## SHA-256 Manifest
 
 ```text
+D91236431891C6F576CA64378A634944FED655AAA6F0140E278FB6CD711CD763  .gitignore
 ECC9F4D7C2418E710EF18D4C04914998A1C129699A07061A0649412BFECE4FB2  Cargo.toml
 DBC54A2D508242D5377BD0D90BFECFD6960F10F2CE7BA1958F973B6A1EB1C687  Cargo.lock
 3E3674A08736F136C8B719B965DCB661808E95ADCDAF2C25D51E97506A99195D  deny.toml
-D91236431891C6F576CA64378A634944FED655AAA6F0140E278FB6CD711CD763  .gitignore
-1F4BB7CFBEB04676E0F580D1C88F98561832E2873A0F06B0681A02D91B220B47  README.md
-96A4320ABFBE955DB4AAF1C5C92E5A84E93782B12377406EE46E63AE1A95A75A  src\crypto.rs
+36A774A68BF920DCE3B931882963F1354F8B708F55B45CD95CD9711B09F96893  README.md
+49911740A9A2AA59941F07FC64AF888A6CE4106CC3B8F56CD213E19D3AA431DC  src\crypto.rs
 8775C8E3CF75EEB52E74DB45733202906A7122E53BBB3114942F21133B3DDE8C  src\format.rs
-FACCA9EADB8C0F5A3C7020A18A13E8864756B2BEE9AA08EFFFC03FC9789D0EA3  src\main.rs
+18E7083AA59037FD6F9697FF75A95502DCC0D0A7750592043AD6CD75AAC6276A  src\main.rs
 C475A0021014A7CCA0FE836E0DD07E6F5F20C1EC405D7D77EF7BAC7678364BCC  src\shred.rs
-5DD89744973D64E496B15265C9E573B4E86527FC23728231E7B484E87BC7F881  src\win32.rs
-1F4BB7CFBEB04676E0F580D1C88F98561832E2873A0F06B0681A02D91B220B47  Documentation\README_updated.md
-D92CFE4741C8F92CFE5FD4A094AF211CC08511E1E5730AC788411E818398DCE6  Documentation\THREAT_MODEL.md
-9F60A312B67E80CC1B3DACEA02EE6FEA38F92566467EBF9714444B9FC698C14A  Documentation\TPF2_FILE_FORMAT.md
-3EDF8FD92E3D7B38521123BE37BC98FB1DD47DBE7D19CE6AC679F498C4746C24  Documentation\TripplePulsarVault_Architecture_Security_Overview.md
-9D31E952B4C5A71A2D6F624D3F319D6BC21BF20ED63B1DD23EAEE8C99E05CD3B  Documentation\TripplePulsarVault_White_Paper.md
+8C6CCB94208458BF4AE9C5D69D97281BF3D5DEC790EBA179622C921726EFECFD  src\win32.rs
+36A774A68BF920DCE3B931882963F1354F8B708F55B45CD95CD9711B09F96893  Documentation\README.md
+555C8A6B75EE503527289148C95B3D3964DC28F006452323234088369BBB6563  Documentation\THREAT_MODEL.md
+536064FF2B4DECFE5935B2FCD7A74C13C8E733C72212B9DD15CC76B597994AE8  Documentation\TPF2_FILE_FORMAT.md
+23405E24B3A84BF0F6DF77AA2F24B48707EB4F87ED162631C5BE79B44AB18AF4  Documentation\TripplePulsarVault_Architecture_Security_Overview.md
+68FC9811D6229781D0CAD90397A30EF81CC2BDF0439ED5CD7506A8F5D4B4CCB0  Documentation\TripplePulsarVault_White_Paper.md
 ```
 
-## Release Status
+## Final Status
 
-TripplePulsar Vault 3.0 passed source validation, release-build validation, runtime launch validation, and dependency policy validation for the current repository state. The project is ready for GitHub publication.
+Final observed state for the repository:
+
+- source compiles successfully
+- release build succeeds
+- interactive runtime launches successfully
+- TPM provider path was verified on the target Windows environment
+- secure exit path was verified
+- deny-policy checks pass with warnings only
+- source and documentation hashes have been regenerated for the finalized file set
+
+This validation report reflects the finalized TPV 3.0 state validated in the current session.

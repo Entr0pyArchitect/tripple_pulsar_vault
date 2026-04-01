@@ -18,6 +18,7 @@ use crate::win32::TpmKeyScope;
 const DEFAULT_KDF_M_COST: u32 = 262_144; // 256 MiB
 const DEFAULT_KDF_T_COST: u16 = 3;
 const DEFAULT_KDF_P_COST: u8 = 1;
+const DEFAULT_TPM_KEY_ALIAS: &str = "TPV-TPM-ContentKey";
 
 fn print_banner() {
     let banner = r#"
@@ -111,6 +112,22 @@ fn select_tpm_scope() -> Option<TpmKeyScope> {
             None
         }
     }
+}
+
+fn prompt_tpm_alias(default_alias: &str) -> String {
+    let alias = prompt_input(&format!(
+        "  -> Enter TPM RSA key alias [{}]: ",
+        default_alias
+    ));
+    if alias.trim().is_empty() {
+        default_alias.to_string()
+    } else {
+        alias
+    }
+}
+
+fn prompt_mlkem_key_path(prompt: &str) -> String {
+    prompt_input(prompt)
 }
 
 fn inspect_tpf2_header(header: &Tpf2Header) {
@@ -234,7 +251,8 @@ fn encrypt_tpf2_flow() {
 }
 
 fn encrypt_tpf3_flow() {
-    println!("\n[*] Encrypting TPF3 vault");
+    println!("
+[*] Encrypting TPF3 vault");
     let input_path = prompt_input("  -> Enter path to plaintext file: ");
     let output_path = prompt_input("  -> Enter destination vault path (.tpf3): ");
 
@@ -243,37 +261,40 @@ fn encrypt_tpf3_flow() {
         None => return,
     };
 
-    println!("\nSelect wrap mode:");
+    println!("
+Select wrap mode:");
     println!("1. Direct/local derivation (implemented)");
-    println!("2. TPM-wrapped content key (provisioning available, wrap path pending)");
-    println!("3. ML-KEM-768 wrapped content key (pending)");
+    println!("2. TPM-wrapped content key (implemented)");
+    println!("3. ML-KEM-768 wrapped content key (implemented)");
 
     let wrap_mode = match prompt_input("Choice: ").as_str() {
         "1" => KeyWrapMode::None,
-        "2" => {
-            println!("[!] TPM-wrapped vault creation is not wired yet.");
-            println!("[*] Use the TPM provisioning menu option to create/check the TPM key first.");
-            return;
-        }
-        "3" => {
-            println!("[!] ML-KEM-768 wrapped vault creation is not wired yet.");
-            return;
-        }
+        "2" => KeyWrapMode::TpmWrapped,
+        "3" => KeyWrapMode::MlKem768,
         _ => {
             eprintln!("[!] Invalid wrap mode selection.");
             return;
         }
     };
 
-    let dataset_hash = match load_optional_dataset_hash(true) {
-        Ok(hash) => hash,
-        Err(_) => return,
+    let dataset_hash = if wrap_mode == KeyWrapMode::None {
+        match load_optional_dataset_hash(true) {
+            Ok(hash) => hash,
+            Err(_) => return,
+        }
+    } else {
+        None
     };
 
     let wipe_source = prompt_yes_no(
         "  -> Securely overwrite the plaintext source after encryption? (y/n): ",
     );
-    let passphrase = prompt_passphrase();
+
+    let passphrase = if wrap_mode == KeyWrapMode::None {
+        Some(prompt_passphrase())
+    } else {
+        None
+    };
 
     println!("[*] Reading plaintext file...");
     let plaintext = match fs::read(&input_path) {
@@ -288,6 +309,109 @@ fn encrypt_tpf3_flow() {
     thread_rng().fill_bytes(&mut os_salt);
     let nonce = crypto::generate_tpf3_nonce(cipher_suite);
 
+    let (wrapped_key, kem_ciphertext, tpm_policy, content_key) = match wrap_mode {
+        KeyWrapMode::None => {
+            println!("[*] Deriving TPF3 content key...");
+            let temp_header = match Tpf3Header::new_v3(
+                0,
+                cipher_suite,
+                KeyWrapMode::None,
+                DEFAULT_KDF_M_COST,
+                DEFAULT_KDF_T_COST,
+                DEFAULT_KDF_P_COST,
+                os_salt,
+                nonce.clone(),
+                vec![],
+                vec![],
+                vec![],
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[!] Failed to build temporary TPF3 header: {e}");
+                    return;
+                }
+            };
+
+            let content_key = match crypto::derive_tpf3_content_key(
+                passphrase.as_ref().expect("passphrase required for direct mode"),
+                dataset_hash,
+                &temp_header,
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[!] Key derivation failed: {e}");
+                    return;
+                }
+            };
+
+            (vec![], vec![], vec![], content_key)
+        }
+        KeyWrapMode::TpmWrapped => {
+            if !win32::tpm_provider_available() {
+                eprintln!("[!] TPM provider is unavailable on this system.");
+                return;
+            }
+
+            let scope = match select_tpm_scope() {
+                Some(scope) => scope,
+                None => return,
+            };
+
+            let alias = prompt_tpm_alias(DEFAULT_TPM_KEY_ALIAS);
+
+            println!("[*] Ensuring TPM RSA key exists...");
+            if let Err(e) = win32::ensure_tpm_rsa_key(&alias, scope) {
+                eprintln!("[!] Failed to provision/open TPM RSA key: {e}");
+                return;
+            }
+
+            println!("[*] Generating random TPF3 content key...");
+            let content_key = crypto::generate_tpf3_random_content_key(cipher_suite);
+
+            println!("[*] Wrapping content key with TPM-backed RSA key...");
+            let (wrapped_key, tpm_policy) =
+                match crypto::tpm_wrap_tpf3_content_key(&content_key, &alias, scope) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        eprintln!("[!] Failed to TPM-wrap content key: {e}");
+                        return;
+                    }
+                };
+
+            (wrapped_key, vec![], tpm_policy, content_key)
+        }
+        KeyWrapMode::MlKem768 => {
+            let pubkey_path =
+                prompt_mlkem_key_path("  -> Enter recipient ML-KEM-768 public key path: ");
+
+            let recipient_public_key_bytes = match fs::read(&pubkey_path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("[!] Failed to read ML-KEM public key file: {e}");
+                    return;
+                }
+            };
+
+            println!("[*] Generating random TPF3 content key...");
+            let content_key = crypto::generate_tpf3_random_content_key(cipher_suite);
+
+            println!("[*] Wrapping content key with ML-KEM-768...");
+            let (wrapped_key, kem_ciphertext) =
+                match crypto::mlkem768_wrap_tpf3_content_key(
+                    &content_key,
+                    &recipient_public_key_bytes,
+                ) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        eprintln!("[!] Failed to ML-KEM-wrap content key: {e}");
+                        return;
+                    }
+                };
+
+            (wrapped_key, kem_ciphertext, vec![], content_key)
+        }
+    };
+
     let header = match Tpf3Header::new_v3(
         0,
         cipher_suite,
@@ -297,22 +421,13 @@ fn encrypt_tpf3_flow() {
         DEFAULT_KDF_P_COST,
         os_salt,
         nonce,
-        vec![],
-        vec![],
-        vec![],
+        wrapped_key,
+        kem_ciphertext,
+        tpm_policy,
     ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("[!] Failed to build TPF3 header: {e}");
-            return;
-        }
-    };
-
-    println!("[*] Deriving TPF3 content key...");
-    let content_key = match crypto::derive_tpf3_content_key(&passphrase, dataset_hash, &header) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("[!] Key derivation failed: {e}");
             return;
         }
     };
@@ -417,20 +532,6 @@ fn decrypt_vault_flow() {
         ParsedVaultHeader::Tpf3(header) => {
             inspect_tpf3_header(&header);
 
-            if header.wrap_mode != KeyWrapMode::None {
-                eprintln!(
-                    "[!] This TPF3 vault uses {}, but wrapped-key decryption is not wired in this build yet.",
-                    header.wrap_mode_name()
-                );
-                return;
-            }
-
-            let dataset_hash = match load_optional_dataset_hash(false) {
-                Ok(hash) => hash,
-                Err(_) => return,
-            };
-
-            let passphrase = prompt_passphrase();
             let body_offset = header.body_offset();
             if vault_data.len() < body_offset {
                 eprintln!("[!] Vault payload offset is invalid.");
@@ -439,13 +540,58 @@ fn decrypt_vault_flow() {
 
             let ciphertext = &vault_data[body_offset..];
 
-            println!("[*] Deriving TPF3 content key...");
-            let content_key = match crypto::derive_tpf3_content_key(&passphrase, dataset_hash, &header)
-            {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("[!] Key derivation failed: {e}");
-                    return;
+            let content_key = match header.wrap_mode {
+                KeyWrapMode::None => {
+                    let dataset_hash = match load_optional_dataset_hash(false) {
+                        Ok(hash) => hash,
+                        Err(_) => return,
+                    };
+
+                    let passphrase = prompt_passphrase();
+
+                    println!("[*] Deriving TPF3 content key...");
+                    match crypto::derive_tpf3_content_key(&passphrase, dataset_hash, &header) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[!] Key derivation failed: {e}");
+                            return;
+                        }
+                    }
+                }
+                KeyWrapMode::TpmWrapped => {
+                    println!("[*] Recovering TPM-wrapped TPF3 content key...");
+                    match crypto::tpm_unwrap_tpf3_content_key(&header) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[!] Failed to unwrap TPM content key: {e}");
+                            return;
+                        }
+                    }
+                }
+                KeyWrapMode::MlKem768 => {
+                    let privkey_path =
+                        prompt_mlkem_key_path("  -> Enter ML-KEM-768 private key path: ");
+
+                    let recipient_private_key_bytes = match fs::read(&privkey_path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            eprintln!("[!] Failed to read ML-KEM private key file: {e}");
+                            return;
+                        }
+                    };
+
+                    println!("[*] Unwrapping TPF3 content key with ML-KEM-768...");
+                    match crypto::mlkem768_unwrap_tpf3_content_key(
+                        &header.wrapped_key,
+                        &header.kem_ciphertext,
+                        &recipient_private_key_bytes,
+                    ) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[!] Failed to unwrap ML-KEM content key: {e}");
+                            return;
+                        }
+                    }
                 }
             };
 
@@ -460,7 +606,7 @@ fn decrypt_vault_flow() {
                 }
                 Err(_) => {
                     eprintln!(
-                        "[!] Decryption failed. Check the passphrase, dataset selection, cipher choice, or file integrity."
+                        "[!] Decryption failed. Check the credentials, dataset selection, cipher choice, TPM context, or file integrity."
                     );
                     return;
                 }
@@ -499,35 +645,68 @@ fn check_tpm_provider_flow() {
     if win32::tpm_provider_available() {
         println!("[+] Microsoft Platform Crypto Provider is available.");
     } else {
-        println!("[!] TPM provider is not available on this system.");
+        println!("[!] Microsoft Platform Crypto Provider is unavailable on this system.");
+    }
+}
+
+fn generate_mlkem_keypair_flow() {
+    println!("\n[*] ML-KEM-768 keypair generation");
+    let public_key_path =
+        prompt_mlkem_key_path("  -> Enter destination public key path (.mlkem.pub): ");
+    let private_key_path =
+        prompt_mlkem_key_path("  -> Enter destination private key path (.mlkem.sec): ");
+
+    match crypto::generate_mlkem768_keypair_files(&public_key_path, &private_key_path) {
+        Ok(()) => println!("[+] ML-KEM-768 keypair generated successfully."),
+        Err(e) => eprintln!("[!] Failed to generate ML-KEM-768 keypair: {e}"),
     }
 }
 
 fn provision_tpm_key_flow() {
-    println!("\n[*] TPM key provisioning");
-    let alias = prompt_input("  -> Enter TPM key alias: ");
+    println!("\n[*] TPM RSA key provisioning");
+    if !win32::tpm_provider_available() {
+        eprintln!("[!] TPM provider is unavailable on this system.");
+        return;
+    }
+
     let scope = match select_tpm_scope() {
         Some(scope) => scope,
         None => return,
     };
 
-    println!("[*] Ensuring TPM key exists for scope {}...", scope.label());
+    let alias = prompt_tpm_alias(DEFAULT_TPM_KEY_ALIAS);
+
+    println!(
+        "[*] Ensuring TPM RSA key '{}' exists in scope {}...",
+        alias,
+        scope.label()
+    );
+
     match win32::ensure_tpm_rsa_key(&alias, scope) {
-        Ok(()) => println!("[+] TPM RSA key is available under alias '{}'.", alias),
-        Err(e) => eprintln!("[!] TPM key provisioning failed: {e}"),
+        Ok(()) => println!("[+] TPM RSA key is ready."),
+        Err(e) => eprintln!("[!] Failed to provision TPM RSA key: {e}"),
     }
 }
 
-fn main() {
-    print_banner();
+fn secure_exit_flow(startup_buffer: &mut [u8]) {
+    println!("\n[*] Performing secure exit...");
+    secure_teardown(startup_buffer);
+    println!("[+] Session closed.");
+}
 
-    let mut startup_buffer = [0u8; 32];
+fn emergency_exit_flow(startup_buffer: &mut [u8]) {
+    eprintln!("\n[!] Emergency exit initiated...");
+    secure_teardown(startup_buffer);
+    eprintln!("[!] Emergency teardown complete.");
+}
+
+fn main() {
+    let mut startup_buffer = vec![0u8; 4096];
     if let Err(e) = win32::lock_memory(&mut startup_buffer) {
-        eprintln!(
-            "[WARNING] Memory locking failed: {}. Continue only on a trusted host.",
-            e
-        );
+        eprintln!("[WARNING] Failed to lock startup buffer in RAM: {e}");
     }
+
+    print_banner();
 
     loop {
         println!("=== TripplePulsar Vault 3.0 ===");
@@ -537,36 +716,27 @@ fn main() {
         println!("4. Inspect vault header");
         println!("5. Check TPM provider");
         println!("6. Provision TPM RSA key");
-        println!("7. Secure exit");
+        println!("7. Generate ML-KEM-768 keypair");
+        println!("8. Secure exit");
         println!("0. Emergency exit");
-        print!("Select an option: ");
-        io::stdout().flush().unwrap();
 
-        let mut choice = String::new();
-        io::stdin().read_line(&mut choice).unwrap();
-
-        match choice.trim() {
+        match prompt_input("Select an option: ").as_str() {
             "1" => encrypt_tpf2_flow(),
             "2" => encrypt_tpf3_flow(),
             "3" => decrypt_vault_flow(),
             "4" => inspect_vault_flow(),
             "5" => check_tpm_provider_flow(),
             "6" => provision_tpm_key_flow(),
-            "7" => {
-                println!("\n[*] Performing secure exit...");
-                secure_teardown(&mut startup_buffer);
-                println!("[+] Session closed.");
+            "7" => generate_mlkem_keypair_flow(),
+            "8" => {
+                secure_exit_flow(&mut startup_buffer);
                 break;
             }
             "0" => {
-                println!("\n[!] Emergency exit requested.");
-                secure_teardown(&mut startup_buffer);
-                println!("[+] Teardown complete.");
-                std::process::exit(0);
+                emergency_exit_flow(&mut startup_buffer);
+                break;
             }
-            _ => {
-                println!("[!] Invalid option. Please select an option from 0 to 7.");
-            }
+            _ => eprintln!("[!] Invalid option.\n"),
         }
 
         println!();

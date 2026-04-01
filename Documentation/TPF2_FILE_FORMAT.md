@@ -5,7 +5,7 @@ TripplePulsar Vault currently supports two on-disk container families:
 - **TPF2** for legacy and TPV 2.0-compatible vaults
 - **TPF3** for the modern extensible format used by TPV 3.0
 
-This document reflects the **current codebase** and is intended to match the active Rust implementation.
+This document reflects the **final validated TPV 3.0 code state**.
 
 ---
 
@@ -224,12 +224,14 @@ The implementation validates the following:
 
 - nonce length must match the selected cipher suite
 - `wrap_mode = None` requires empty `kem_ciphertext` and empty `tpm_policy`
-- `wrap_mode = TpmWrapped` requires a non-empty `wrapped_key` and an empty `kem_ciphertext`
+- `wrap_mode = TpmWrapped` requires a non-empty `wrapped_key`, an empty `kem_ciphertext`, and a non-empty `tpm_policy`
 - `wrap_mode = MlKem768` requires non-empty `wrapped_key` and non-empty `kem_ciphertext`, and an empty `tpm_policy`
 
-### Key Derivation
+### Key Material Model
 
-For the currently implemented **direct/local derivation** mode (`wrap_mode = None`):
+TPF3 supports three operational keying modes.
+
+#### 3.1 Direct / Local Derivation (`wrap_mode = None`)
 
 ```text
 dataset_hash = optional BLAKE3(dataset)
@@ -246,6 +248,37 @@ HKDF info labels currently used:
 
 - `TPF3:ENC:AES-256-GCM`
 - `TPF3:ENC:XCHACHA20-POLY1305`
+
+This is the only TPF3 mode that uses optional dataset binding and a user passphrase for content-key derivation.
+
+#### 3.2 TPM-Wrapped Content Key (`wrap_mode = TpmWrapped`)
+
+In TPM-wrapped mode, TPV generates a fresh random 32-byte content key for the vault payload and wraps that key through a TPM-backed RSA key managed by the Windows Platform Crypto Provider.
+
+Stored blobs:
+
+- `wrapped_key`: TPM-wrapped content key bytes
+- `kem_ciphertext`: empty
+- `tpm_policy`: TPM policy / key-selection metadata required for unwrap
+
+The content key is **not** derived from the passphrase in this mode.
+
+#### 3.3 ML-KEM-768 Wrapped Content Key (`wrap_mode = MlKem768`)
+
+In ML-KEM mode, TPV generates a fresh random 32-byte content key for the vault payload, then:
+
+1. loads the recipient ML-KEM-768 public key
+2. encapsulates a shared secret
+3. derives a symmetric key-wrapping key with HKDF-SHA256
+4. wraps the random content key under AES-256-GCM
+
+Stored blobs:
+
+- `wrapped_key`: `wrap_nonce || AES-GCM-wrapped content key`
+- `kem_ciphertext`: ML-KEM ciphertext returned by encapsulation
+- `tpm_policy`: empty
+
+The vault payload content key is recovered during decryption using the corresponding ML-KEM-768 private key.
 
 ### Authenticated Encryption
 
@@ -282,30 +315,33 @@ payload = XChaCha20-Poly1305-Encrypt(
 - TPF2 encrypt / decrypt / inspect
 - TPF3 encrypt / decrypt / inspect
 - TPF3 direct/local derivation (`wrap_mode = None`)
+- TPF3 TPM-wrapped content key encryption/decryption
+- TPF3 ML-KEM-768 wrapped content key encryption/decryption
 - TPF3 AES-256-GCM
 - TPF3 XChaCha20-Poly1305
 - TPM provider detection and TPM RSA key provisioning utilities
+- ML-KEM-768 keypair generation through the CLI
 
-### Defined in Format, Not Yet Wired End-to-End
+### Operational Notes
 
-- TPF3 TPM-wrapped content key encryption/decryption
-- TPF3 ML-KEM-768 wrapped content key encryption/decryption
-
-The format reserves space for wrapped-key metadata today, but the current CLI only performs full TPF3 encryption/decryption for direct/local derivation mode.
+- direct/local derivation requires the same dataset and passphrase inputs if dataset binding was used
+- TPM-wrapped mode depends on the required TPM-backed key and policy metadata being present and accessible on the Windows host
+- ML-KEM-wrapped mode depends on the matching ML-KEM-768 private key for decryption
 
 ---
 
 ## 5. Security Notes
 
-- If a dataset is used during encryption, the same dataset must be supplied during decryption.
+- If a dataset is used during TPF2 or TPF3 direct-mode encryption, the same dataset must be supplied during decryption.
 - Authentication must be verified before returning plaintext.
 - Header fields are authenticated through AEAD AAD binding.
+- Wrapped-key modes protect the payload with a random content key rather than passphrase-derived encryption material.
 - Overwrite-based deletion is best-effort only and is not guaranteed on SSDs or other wear-leveling storage.
 
 ---
 
 ## 6. Summary
 
-TPF2 remains the compact backward-compatible vault format, while TPF3 provides the forward-looking extensible container for TPV 3.0.
+TPF2 remains the compact backward-compatible vault format, while TPF3 provides the extensible container for TPV 3.0 with cipher agility and multiple keying modes.
 
-The current codebase supports both formats and dispatches parsing strictly by file magic.
+The final validated TPV 3.0 implementation supports both formats and supports all three TPF3 wrap modes defined by the current codebase: direct/local derivation, TPM-wrapped content keys, and ML-KEM-768 wrapped content keys.

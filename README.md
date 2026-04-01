@@ -14,7 +14,9 @@
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-TripplePulsar Vault (TPV) is a Windows-oriented cryptographic file vault written in Rust. It focuses on memory-hardened key derivation, authenticated encryption, and careful handling of sensitive material in RAM.
+TripplePulsar Vault (TPV) is a Windows-oriented cryptographic file vault written in Rust. It focuses on memory-hardened key derivation, authenticated encryption, careful handling of sensitive material in memory, and an extensible authenticated container format.
+
+## Current Capabilities
 
 The current codebase supports:
 
@@ -24,8 +26,13 @@ The current codebase supports:
 - **AES-256-GCM** for TPF2 and TPF3
 - **XChaCha20-Poly1305** for TPF3
 - Optional external dataset hashing with **BLAKE3**
-- Windows clipboard clearing and memory-locking helpers
-- TPM provider checks and TPM RSA key provisioning for future wrapped-key workflows
+- **TPF3 direct/local derivation** mode
+- **TPF3 TPM-wrapped content-key** mode
+- **TPF3 ML-KEM-768 wrapped content-key** mode
+- Windows clipboard clearing and best-effort memory-locking helpers
+- TPM provider checks and TPM RSA key provisioning
+- ML-KEM-768 keypair generation from the CLI
+- Optional overwrite-and-delete of source plaintext files
 
 ## Architecture Overview
 
@@ -41,118 +48,62 @@ flowchart TD
     H[TPF2 header as AAD] -.-> G
     G --> I[TPF2 vault]
 
-    E -->|TPF3| J{Cipher suite}
+    E -->|TPF3 direct| J{Cipher suite}
     J -->|AES-256-GCM| K[HKDF expand - AES key]
     J -->|XChaCha20-Poly1305| L[HKDF expand - XChaCha key]
     K --> M[Encrypt plaintext]
     L --> M[Encrypt plaintext]
     N[TPF3 serialized header as AAD] -.-> M
     M --> O[TPF3 vault]
+
+    E -->|TPF3 wrapped| P[Generate random 32-byte content key]
+    P --> Q{Wrap mode}
+    Q -->|TPM| R[Wrap with TPM-backed RSA key]
+    Q -->|ML-KEM-768| S[Encapsulate shared secret and wrap key]
+    R --> T[Encrypt plaintext with content key]
+    S --> T
+    N -.-> T
+    T --> O
 ```
 
 ## Current Status
 
-TripplePulsar Vault 3.0 is in a working state for local encryption, decryption, and header inspection. The CLI currently builds cleanly and supports both TPF2 and direct-derivation TPF3 workflows. The codebase also includes TPM provider discovery and TPM RSA key provisioning on Windows.
+TripplePulsar Vault 3.0 now supports end-to-end local encryption, decryption, and header inspection for both TPF2 and TPF3, including wrapped-key TPF3 workflows.
 
 **Implemented now**
 
-- TPF2 encryption and decryption
-- TPF3 encryption and decryption using direct/local derivation
-- AES-256-GCM and XChaCha20-Poly1305 selection for TPF3
-- Vault header inspection for TPF2 and TPF3
-- Optional dataset-based key input using streaming BLAKE3
-- Secure-exit helpers and optional source-file overwrite/delete
+- TPF2 encryption, decryption, and inspection
+- TPF3 encryption, decryption, and inspection
+- TPF3 direct/local derivation (`wrap_mode = None`)
+- TPF3 TPM-wrapped content-key encryption and decryption
+- TPF3 ML-KEM-768 wrapped content-key encryption and decryption
+- TPF3 AES-256-GCM and XChaCha20-Poly1305 cipher selection
+- Optional dataset-based derivation input using streaming BLAKE3
+- Secure-exit helpers and optional plaintext source overwrite/delete
 - Windows TPM provider checks and TPM RSA key provisioning
-
-**Defined but not fully wired yet**
-
-- TPF3 TPM-wrapped content-key encryption/decryption
-- TPF3 ML-KEM-768 wrapped-key encryption/decryption
-
-## Cryptographic Design
-
-### Key Derivation
-
-TPV derives keys from:
-
-- the user passphrase
-- an optional external dataset hash
-- a random per-vault OS salt
-
-The dataset, when used, is hashed in a streaming fashion with BLAKE3 so large files do not need to be loaded fully into memory.
-
-High-level derivation flow:
-
-```text
-dataset_hash = BLAKE3(dataset)            // optional
-IKM = passphrase || dataset_hash          // if dataset is used
-root_key = Argon2id(IKM, os_salt)
-enc_key = HKDF-SHA256(root_key, domain)
-```
-
-For TPF2, the vault uses the legacy-compatible header format while still using the newer key schedule for version 2 vaults. For TPF3, the content-encryption key is expanded with a cipher-specific HKDF domain so AES and XChaCha key material stay separated.
-
-### Authenticated Encryption
-
-- **TPF2:** AES-256-GCM
-- **TPF3:** AES-256-GCM or XChaCha20-Poly1305
-
-In both cases, the vault header is bound as **Associated Authenticated Data (AAD)** so tampering with header fields causes authentication failure during decryption.
-
-## File Formats
-
-### TPF2
-
-TPF2 is the legacy-compatible format used for version 1 and version 2 vault parsing. The current code uses a fixed **62-byte** header with:
-
-- magic
-- version
-- flags
-- algorithm id
-- KDF id
-- Argon2 parameters
-- TPM flag
-- reserved bytes
-- 32-byte salt
-- 12-byte nonce
-
-### TPF3
-
-TPF3 is the modern format. It supports:
-
-- variable nonce length based on cipher suite
-- multiple wrap modes
-- serialized variable-length blob sections
-- modern header validation and parsing
-
-Current TPF3 wrap modes in the format layer:
-
-- `None`
-- `TpmWrapped`
-- `MlKem768`
-
-At the moment, the CLI encryption/decryption path is implemented for `None` only.
+- ML-KEM-768 public/private keypair generation
 
 ## Core Security Properties
 
-- **Memory-hardened derivation:** Argon2id is configured with explicit memory, time, and parallelism parameters.
-- **Tamper detection:** AEAD modes bind the header as AAD.
-- **Streaming dataset hashing:** BLAKE3 uses buffered reads for large inputs.
-- **Secret handling:** `secrecy` and `zeroize` are used to reduce accidental exposure and persistence of key material.
-- **Windows integration:** Clipboard wiping and best-effort memory locking are included.
+- **Memory-hardened derivation:** Argon2id uses explicit memory, time, and parallelism parameters stored in the vault header.
+- **Domain separation:** HKDF-SHA256 expands encryption keys using format- and cipher-specific labels.
+- **Tamper detection:** AEAD modes bind the serialized vault header as associated authenticated data.
+- **Streaming dataset hashing:** BLAKE3 uses buffered reads, so large files do not need to be loaded fully into memory.
+- **Secret handling:** `secrecy` and `zeroize` are used to reduce accidental retention of sensitive values.
+- **Windows hygiene:** Clipboard wiping and best-effort memory locking are included.
 - **Best-effort source cleanup:** Optional overwrite-and-delete is available for plaintext input files.
 
 ## Build Requirements
 
 - Rust toolchain with Cargo
 - Windows 10 or Windows 11
+- TPM-backed workflows require a usable Microsoft Platform Crypto Provider on the host
 
 ## Build
 
 ```bash
 git clone https://github.com/Entr0pyArchitect/tripple_pulsar_vault.git
 cd tripple_pulsar_vault
-cargo deny check
 cargo check
 cargo build --release
 ```
@@ -173,10 +124,11 @@ The current interactive menu provides:
 4. Inspect vault header
 5. Check TPM provider
 6. Provision TPM RSA key
-7. Secure exit
+7. Generate ML-KEM-768 keypair
+8. Secure exit
 0. Emergency exit
 
-## Typical Workflow
+## Typical Workflows
 
 ### Encrypt a TPF2 vault
 
@@ -193,18 +145,62 @@ The current interactive menu provides:
 2. Choose a plaintext input file
 3. Choose a destination `.tpf3` path
 4. Select a cipher suite
-5. Select wrap mode `1` for direct/local derivation
-6. Decide whether to include an auxiliary dataset
-7. Decide whether to securely overwrite the original file
-8. Enter the passphrase
+5. Select a wrap mode:
+   - `1` direct/local derivation
+   - `2` TPM-wrapped content key
+   - `3` ML-KEM-768 wrapped content key
+6. Decide whether to securely overwrite the original file
+7. Complete the mode-specific inputs:
+   - **Direct/local derivation:** optional dataset, then passphrase
+   - **TPM-wrapped:** TPM scope and key alias
+   - **ML-KEM-768 wrapped:** recipient public key path
 
 ### Decrypt a vault
 
 1. Select option `3`
 2. Provide the vault path
 3. Choose the destination plaintext path
-4. Provide the same dataset if one was used during encryption
-5. Enter the passphrase
+4. Complete the mode-specific inputs:
+   - **TPF2:** optional dataset, then passphrase
+   - **TPF3 direct/local derivation:** optional dataset, then passphrase
+   - **TPF3 TPM-wrapped:** uses the TPM policy embedded in the header
+   - **TPF3 ML-KEM-768 wrapped:** provide the matching private key path
+
+### Generate an ML-KEM-768 keypair
+
+1. Select option `7`
+2. Provide the destination public key path
+3. Provide the destination private key path
+
+## TPF3 Wrap Modes
+
+### Direct / Local Derivation
+
+This mode derives the content-encryption key from:
+
+- passphrase
+- optional dataset hash
+- random per-vault OS salt
+
+Use this mode when you want password-based protection with optional deterministic dataset binding.
+
+### TPM-Wrapped Content Key
+
+This mode generates a random TPF3 content key and wraps it with a TPM-backed RSA key through the Windows platform crypto provider. The header stores:
+
+- `wrapped_key`
+- `tpm_policy`
+
+Use this mode when you want the decryption path bound to the provisioned TPM-backed key material referenced by the embedded TPM policy.
+
+### ML-KEM-768 Wrapped Content Key
+
+This mode generates a random TPF3 content key and wraps it using an ML-KEM-768 recipient public key. The header stores:
+
+- `wrapped_key`
+- `kem_ciphertext`
+
+Use this mode when you want the vault content key recoverable by the holder of the matching ML-KEM-768 private key.
 
 ## TPM Notes
 
@@ -213,8 +209,19 @@ The Windows code can:
 - check whether the Microsoft Platform Crypto Provider is available
 - check whether a persisted TPM-backed key already exists
 - create and finalize a persisted TPM RSA key by alias
+- wrap and unwrap TPF3 content keys using the provisioned TPM-backed RSA key
 
-That provisioning support is present now, but TPM-wrapped TPF3 content-key workflows are still pending in the main encrypt/decrypt path.
+TPM-backed vault operation depends on the availability and behavior of the Microsoft Platform Crypto Provider on the host system.
+
+## ML-KEM Notes
+
+The ML-KEM workflow is file-based:
+
+- generate a public/private keypair from the CLI
+- distribute the public key to the encrypting side
+- keep the private key for decryption
+
+The current implementation uses ML-KEM-768 to derive a shared secret, expands a key-wrapping key with HKDF-SHA256, and wraps the random TPF3 content key under AES-256-GCM.
 
 ## Secure Deletion Notes
 
@@ -242,6 +249,7 @@ It is **not** designed to protect against:
 - hardware interception attacks
 - passphrase compromise
 - loss of the required external dataset
+- privileged host compromise during runtime
 
 ## Project Notes
 
